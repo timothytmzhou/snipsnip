@@ -9,7 +9,7 @@ pub enum GrammarSymbol {
 
 /// One production with its AST-building action.
 ///
-/// `kept_positions` are the 1-based, strictly increasing positions of the
+/// `selected_positions` are the 1-based, strictly increasing positions of the
 /// symbols that become the children of `constructor`; other symbols are
 /// dropped from the AST.
 #[derive(Debug, Clone)]
@@ -17,7 +17,7 @@ pub struct Production {
     pub nonterminal: String,
     pub symbols: Vec<GrammarSymbol>,
     pub constructor: String,
-    pub kept_positions: Vec<usize>,
+    pub selected_positions: Vec<usize>,
 }
 
 /// Index of a production within a grammar.
@@ -57,7 +57,7 @@ impl Lexeme {
 #[derive(Debug)]
 pub enum GrammarError {
     UnknownNonterminal(String),
-    InvalidKeptPositions(ProductionId),
+    InvalidSelectedPositions(ProductionId),
     EmptyProduction(ProductionId),
     LeftRecursive(String),
     NotLl1 { nonterminal: String, kind: String },
@@ -81,9 +81,9 @@ impl Grammar {
         }
         for (id, production) in productions.iter().enumerate() {
             let mut previous = 0;
-            for &position in &production.kept_positions {
+            for &position in &production.selected_positions {
                 if position <= previous || position > production.symbols.len() {
-                    return Err(GrammarError::InvalidKeptPositions(id));
+                    return Err(GrammarError::InvalidSelectedPositions(id));
                 }
                 previous = position;
             }
@@ -105,7 +105,7 @@ impl Grammar {
             }
         }
         reject_left_recursion(&productions)?;
-        let starting = starting_kinds(&productions);
+        let starting = first_kinds(&productions);
         let mut prediction = HashMap::new();
         for (id, production) in productions.iter().enumerate() {
             let kinds: Vec<String> = match &production.symbols[0] {
@@ -208,7 +208,7 @@ fn visit_nonterminal<'a>(
 }
 
 /// Computes, per nonterminal, the lexeme kinds that can begin it, by fixpoint.
-fn starting_kinds(productions: &[Production]) -> HashMap<String, HashSet<String>> {
+fn first_kinds(productions: &[Production]) -> HashMap<String, HashSet<String>> {
     let mut starting: HashMap<String, HashSet<String>> = HashMap::new();
     for production in productions {
         starting.entry(production.nonterminal.clone()).or_default();
@@ -244,7 +244,7 @@ mod tests {
                     nonterminal: "Expr".into(),
                     symbols: vec![GrammarSymbol::LexemeKind("number".into())],
                     constructor: "Num".into(),
-                    kept_positions: vec![1],
+                    selected_positions: vec![1],
                 },
                 Production {
                     nonterminal: "Expr".into(),
@@ -256,7 +256,7 @@ mod tests {
                         GrammarSymbol::LexemeKind(")".into()),
                     ],
                     constructor: "Add".into(),
-                    kept_positions: vec![2, 4],
+                    selected_positions: vec![2, 4],
                 },
             ],
         )
@@ -281,13 +281,13 @@ mod tests {
                     nonterminal: "Start".into(),
                     symbols: vec![GrammarSymbol::Nonterminal("Middle".into())],
                     constructor: "Wrap".into(),
-                    kept_positions: vec![1],
+                    selected_positions: vec![1],
                 },
                 Production {
                     nonterminal: "Middle".into(),
                     symbols: vec![GrammarSymbol::LexemeKind("number".into())],
                     constructor: "Num".into(),
-                    kept_positions: vec![1],
+                    selected_positions: vec![1],
                 },
             ],
         )

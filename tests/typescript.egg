@@ -1,0 +1,78 @@
+
+(datatype Ast
+  (NumLit i64)
+  (StrLit String)
+  (BoolTrue)
+  (BoolFalse)
+  (Plus Ast Ast)
+  (Lt Ast Ast)
+  (And Ast Ast)
+  (Cond Ast Ast Ast)
+  (App String Ast)
+  (NumberTyped)
+  (StringTyped)
+  (BooleanTyped))
+(datatype Type (TNumber) (TString) (TBoolean))
+(relation HasType (Ast Type))
+
+; literals
+(rule ((= e (NumLit n))) ((HasType e (TNumber))))
+(rule ((= e (StrLit s))) ((HasType e (TString))))
+(rule ((= e (BoolTrue))) ((HasType e (TBoolean))))
+(rule ((= e (BoolFalse))) ((HasType e (TBoolean))))
+
+; + : number + number is number; if either side is a string the result is
+; string concatenation (TypeScript's operator overloading)
+(rule ((= e (Plus a b)) (HasType a (TNumber)) (HasType b (TNumber)))
+      ((HasType e (TNumber))))
+(rule ((= e (Plus a b)) (HasType a (TString)) (HasType b t))
+      ((HasType e (TString))))
+(rule ((= e (Plus a b)) (HasType a t) (HasType b (TString)))
+      ((HasType e (TString))))
+
+; < : both numbers or both strings (mixed comparison is a type error)
+(rule ((= e (Lt a b)) (HasType a (TNumber)) (HasType b (TNumber)))
+      ((HasType e (TBoolean))))
+(rule ((= e (Lt a b)) (HasType a (TString)) (HasType b (TString)))
+      ((HasType e (TBoolean))))
+
+; && : simplified to same-type operands
+(rule ((= e (And a b)) (HasType a t) (HasType b t)) ((HasType e t)))
+
+; ?: : any condition (truthiness), same-type branches
+(rule ((= e (Cond c a b)) (HasType c tc) (HasType a t) (HasType b t))
+      ((HasType e t)))
+
+; expressions of one type collapse into that type's witness class
+(rule ((HasType e (TNumber))) ((union e (NumberTyped))))
+(rule ((HasType e (TString))) ((union e (StringTyped))))
+(rule ((HasType e (TBoolean))) ((union e (BooleanTyped))))
+
+; seeds: one expression per typing shape the tests rely on
+(let seed01 (Plus (NumLit 0) (NumLit 0)))
+(let seed02 (Plus (StrLit "") (StrLit "")))
+(let seed03 (Plus (StrLit "") (NumLit 0)))
+(let seed04 (Plus (NumLit 0) (StrLit "")))
+(let seed05 (Plus (StrLit "") (BoolTrue)))
+(let seed06 (Plus (BoolTrue) (StrLit "")))
+(let seed07 (Lt (NumLit 0) (NumLit 0)))
+(let seed08 (Lt (StrLit "") (StrLit "")))
+(let seed09 (And (BoolTrue) (BoolFalse)))
+(let seed10 (And (NumLit 0) (NumLit 0)))
+(let seed11 (Cond (BoolTrue) (NumLit 0) (NumLit 0)))
+(let seed12 (Cond (NumLit 0) (StrLit "") (StrLit "")))
+(let seed13 (NumLit 5))
+(let seed14 (StrLit "a"))
+(let seed15 (StrLit "b"))
+
+; function application with built-in signatures
+(rule ((= e (App "abs" a)) (HasType a (TNumber))) ((HasType e (TNumber))))
+(rule ((= e (App "trim" a)) (HasType a (TString))) ((HasType e (TString))))
+(rule ((= e (App "String" a)) (HasType a t)) ((HasType e (TString))))
+(rule ((= e (App "isNaN" a)) (HasType a (TNumber))) ((HasType e (TBoolean))))
+(let seed16 (App "abs" (NumLit 0)))
+(let seed17 (App "trim" (StrLit "")))
+(let seed18 (App "String" (NumLit 0)))
+(let seed19 (App "String" (StrLit "")))
+(let seed20 (App "String" (BoolTrue)))
+(let seed21 (App "isNaN" (NumLit 0)))

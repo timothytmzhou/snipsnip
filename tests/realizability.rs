@@ -12,7 +12,7 @@ fn arithmetic_grammar() -> Grammar {
                 nonterminal: "Expr".into(),
                 symbols: vec![GrammarSymbol::LexemeKind("number".into())],
                 constructor: "Num".into(),
-                kept_positions: vec![1],
+                selected_positions: vec![1],
             },
             Production {
                 nonterminal: "Expr".into(),
@@ -24,7 +24,7 @@ fn arithmetic_grammar() -> Grammar {
                     GrammarSymbol::LexemeKind(")".into()),
                 ],
                 constructor: "Add".into(),
-                kept_positions: vec![2, 4],
+                selected_positions: vec![2, 4],
             },
         ],
     )
@@ -138,7 +138,7 @@ fn non_ll1_grammar_is_rejected() {
                 nonterminal: "Expr".into(),
                 symbols: vec![GrammarSymbol::LexemeKind("number".into())],
                 constructor: "Num".into(),
-                kept_positions: vec![1],
+                selected_positions: vec![1],
             },
             Production {
                 nonterminal: "Expr".into(),
@@ -147,7 +147,7 @@ fn non_ll1_grammar_is_rejected() {
                     GrammarSymbol::LexemeKind("number".into()),
                 ],
                 constructor: "Pair".into(),
-                kept_positions: vec![1, 2],
+                selected_positions: vec![1, 2],
             },
         ],
     );
@@ -171,7 +171,7 @@ fn two_level_grammar() -> Grammar {
                 nonterminal: "Expr".into(),
                 symbols: vec![GrammarSymbol::LexemeKind("number".into())],
                 constructor: "Num".into(),
-                kept_positions: vec![1],
+                selected_positions: vec![1],
             },
             Production {
                 nonterminal: "Expr".into(),
@@ -183,13 +183,13 @@ fn two_level_grammar() -> Grammar {
                     GrammarSymbol::LexemeKind(")".into()),
                 ],
                 constructor: "Add".into(),
-                kept_positions: vec![2, 4],
+                selected_positions: vec![2, 4],
             },
             Production {
                 nonterminal: "Term".into(),
                 symbols: vec![GrammarSymbol::LexemeKind("number".into())],
                 constructor: "Num".into(),
-                kept_positions: vec![1],
+                selected_positions: vec![1],
             },
         ],
     )
@@ -356,7 +356,7 @@ fn left_recursive_grammar_is_rejected() {
                 GrammarSymbol::LexemeKind("+".into()),
             ],
             constructor: "Inc".into(),
-            kept_positions: vec![1],
+            selected_positions: vec![1],
         }],
     );
     assert!(matches!(result, Err(GrammarError::LeftRecursive(_))));
@@ -370,7 +370,7 @@ fn unknown_nonterminal_is_rejected() {
             nonterminal: "Expr".into(),
             symbols: vec![GrammarSymbol::Nonterminal("Missing".into())],
             constructor: "Wrap".into(),
-            kept_positions: vec![1],
+            selected_positions: vec![1],
         }],
     );
     assert!(matches!(result, Err(GrammarError::UnknownNonterminal(_))));
@@ -384,14 +384,14 @@ fn empty_production_is_rejected() {
             nonterminal: "Expr".into(),
             symbols: vec![],
             constructor: "Nothing".into(),
-            kept_positions: vec![],
+            selected_positions: vec![],
         }],
     );
     assert!(matches!(result, Err(GrammarError::EmptyProduction(_))));
 }
 
 #[test]
-fn decreasing_kept_positions_are_rejected() {
+fn decreasing_selected_positions_are_rejected() {
     let result = Grammar::new(
         "Expr",
         vec![Production {
@@ -401,8 +401,8 @@ fn decreasing_kept_positions_are_rejected() {
                 GrammarSymbol::LexemeKind("number".into()),
             ],
             constructor: "Pair".into(),
-            kept_positions: vec![2, 1],
+            selected_positions: vec![2, 1],
         }],
     );
-    assert!(matches!(result, Err(GrammarError::InvalidKeptPositions(_))));
+    assert!(matches!(result, Err(GrammarError::InvalidSelectedPositions(_))));
 }
