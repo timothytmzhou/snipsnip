@@ -24,7 +24,7 @@ pub struct Matcher {
 /// Everything derived from the current e-graph; rebuilt by `refresh`.
 struct State {
     root_class: Option<ClassId>,
-    derives: HashSet<(String, ClassId)>,
+    derives: HashMap<String, HashSet<ClassId>>,
     holes: HashMap<HoleId, Hole>,
     nodes: HashMap<HoleId, PatternNode>,
     realizable: bool,
@@ -101,7 +101,7 @@ impl State {
     fn empty() -> State {
         State {
             root_class: None,
-            derives: HashSet::new(),
+            derives: HashMap::new(),
             holes: HashMap::new(),
             nodes: HashMap::new(),
             realizable: false,
@@ -114,8 +114,7 @@ impl State {
         self.derives = derives_relation(egraph, grammar);
         let mut candidates = HashSet::new();
         if let Some(class) = &self.root_class {
-            let start = grammar.start().to_string();
-            if self.derives.contains(&(start, class.clone())) {
+            if self.derivable(grammar.start(), class) {
                 candidates.insert(class.clone());
             }
         }
@@ -176,7 +175,8 @@ impl State {
             .candidate_classes
             .iter()
             .flat_map(|class| egraph.nodes_in_class(&constructor, class))
-            .filter(|node| self.compatible(node, &selected))
+            .filter(|&node| self.compatible(node, &selected))
+            .cloned()
             .collect();
         if candidate_nodes.is_empty() {
             self.realizable = false;
@@ -200,71 +200,82 @@ impl State {
             },
         );
         if child_holes.is_empty() {
-            self.complete(hole, completed);
+            let (parent, reference, value) = self.complete_step(hole, completed);
+            self.fill(parent, reference, value, completed);
         }
+    }
+
+    /// Is the class reachable by the nonterminal's tree language?
+    fn derivable(&self, nonterminal: &str, class: &ClassId) -> bool {
+        self.derives
+            .get(nonterminal)
+            .is_some_and(|classes| classes.contains(class))
     }
 
     /// Every selected child of the e-node must be reachable by its grammar sort.
     fn compatible(&self, node: &ENode, selected: &[GrammarSymbol]) -> bool {
         node.children.len() == selected.len()
-            && selected
-                .iter()
-                .enumerate()
-                .all(|(index, symbol)| match (symbol, &node.children[index]) {
-                    (GrammarSymbol::Nonterminal(name), ChildValue::Class(class)) => {
-                        self.derives.contains(&(name.clone(), class.clone()))
-                    }
-                    (GrammarSymbol::LexemeKind(_), ChildValue::Class(_)) => false,
-                    (GrammarSymbol::LexemeKind(_), _) => true,
-                    (GrammarSymbol::Nonterminal(_), _) => false,
-                })
+            && requirements(selected, node).is_some_and(|facts| {
+                facts
+                    .iter()
+                    .all(|(nonterminal, class)| self.derivable(nonterminal, class))
+            })
     }
 
-    /// Records a concrete child, re-narrows the open siblings, and cascades.
+    /// Records a concrete child, re-narrows the open siblings, and walks up
+    /// through every node this completes; iterative, so depth is unbounded.
     fn fill(
         &mut self,
-        parent: Parent,
-        reference: InsertRef,
-        value: Option<ChildValue>,
+        mut parent: Parent,
+        mut reference: InsertRef,
+        mut value: Option<ChildValue>,
         completed: &mut Vec<CompletedNode>,
     ) {
-        let Some((owner, index)) = parent else {
-            self.realizable = match (&value, &self.root_class) {
-                (Some(ChildValue::Class(class)), Some(root)) => class == root,
-                _ => false,
+        loop {
+            let Some((owner, index)) = parent else {
+                self.realizable = match (&value, &self.root_class) {
+                    (Some(ChildValue::Class(class)), Some(root)) => class == root,
+                    _ => false,
+                };
+                return;
             };
-            return;
-        };
-        let node = self.nodes.get_mut(&owner).expect("parent node exists");
-        node.children[index] = Child::Filled(reference);
-        node.candidate_nodes
-            .retain(|candidate| Some(&candidate.children[index]) == value.as_ref());
-        if node.candidate_nodes.is_empty() {
-            self.realizable = false;
-        }
-        let open_siblings: Vec<(usize, HoleId)> = node
-            .children
-            .iter()
-            .enumerate()
-            .filter_map(|(i, child)| match child {
-                Child::Hole(id) => Some((i, *id)),
-                Child::Filled(_) => None,
-            })
-            .collect();
-        if open_siblings.is_empty() {
-            self.complete(owner, completed);
-            return;
-        }
-        for (i, id) in open_siblings {
-            let classes = project_classes(&self.nodes[&owner].candidate_nodes, i);
-            if let Some(hole) = self.holes.get_mut(&id) {
-                hole.candidate_classes = classes;
+            let node = self.nodes.get_mut(&owner).expect("parent node exists");
+            node.children[index] = Child::Filled(reference);
+            node.candidate_nodes
+                .retain(|candidate| Some(&candidate.children[index]) == value.as_ref());
+            if node.candidate_nodes.is_empty() {
+                self.realizable = false;
             }
+            let open_siblings: Vec<(usize, HoleId)> = node
+                .children
+                .iter()
+                .enumerate()
+                .filter_map(|(i, child)| match child {
+                    Child::Hole(id) => Some((i, *id)),
+                    Child::Filled(_) => None,
+                })
+                .collect();
+            if open_siblings.is_empty() {
+                (parent, reference, value) = self.complete_step(owner, completed);
+                continue;
+            }
+            for (i, id) in open_siblings {
+                let classes = project_classes(&self.nodes[&owner].candidate_nodes, i);
+                if let Some(hole) = self.holes.get_mut(&id) {
+                    hole.candidate_classes = classes;
+                }
+            }
+            return;
         }
     }
 
-    /// All children are concrete: report the completion and fill the parent.
-    fn complete(&mut self, owner: HoleId, completed: &mut Vec<CompletedNode>) {
+    /// All children are concrete: report the completion and return the fill
+    /// to perform at the parent.
+    fn complete_step(
+        &mut self,
+        owner: HoleId,
+        completed: &mut Vec<CompletedNode>,
+    ) -> (Parent, InsertRef, Option<ChildValue>) {
         let node = self.nodes.remove(&owner).expect("node exists");
         let children = node
             .children
@@ -283,7 +294,7 @@ impl State {
             .candidate_nodes
             .first()
             .map(|candidate| ChildValue::Class(candidate.class.clone()));
-        self.fill(node.parent, InsertRef::Node(owner), value, completed);
+        (node.parent, InsertRef::Node(owner), value)
     }
 }
 
@@ -307,34 +318,71 @@ fn selected_symbols(grammar: &Grammar, production: ProductionId) -> Vec<GrammarS
         .collect()
 }
 
-/// All pairs (nonterminal, class) whose tree language reaches the class.
-fn derives_relation(egraph: &EGraph, grammar: &Grammar) -> HashSet<(String, ClassId)> {
-    let mut derives: HashSet<(String, ClassId)> = HashSet::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for nonterminal in grammar.nonterminals() {
-            for production in grammar.productions_of(&nonterminal) {
-                let selected = selected_symbols(grammar, production);
-                let constructor = &grammar.production(production).constructor;
-                for node in egraph.nodes_of_constructor(constructor) {
-                    if node.children.len() != selected.len() {
-                        continue;
-                    }
-                    let reachable = selected.iter().enumerate().all(|(index, symbol)| {
-                        match (symbol, &node.children[index]) {
-                            (GrammarSymbol::Nonterminal(name), ChildValue::Class(class)) => {
-                                derives.contains(&(name.clone(), class.clone()))
-                            }
-                            (GrammarSymbol::LexemeKind(_), ChildValue::Class(_)) => false,
-                            (GrammarSymbol::LexemeKind(_), _) => true,
-                            (GrammarSymbol::Nonterminal(_), _) => false,
-                        }
-                    });
-                    if reachable {
-                        changed |= derives.insert((nonterminal.clone(), node.class.clone()));
-                    }
+/// The distinct (nonterminal, class) facts the e-node's selected children
+/// need, or None if some selected position can never match.
+fn requirements(
+    selected: &[GrammarSymbol],
+    node: &ENode,
+) -> Option<HashSet<(String, ClassId)>> {
+    let mut facts = HashSet::new();
+    for (index, symbol) in selected.iter().enumerate() {
+        match (symbol, &node.children[index]) {
+            (GrammarSymbol::Nonterminal(name), ChildValue::Class(class)) => {
+                facts.insert((name.clone(), class.clone()));
+            }
+            (GrammarSymbol::LexemeKind(_), ChildValue::Class(_)) => return None,
+            (GrammarSymbol::LexemeKind(_), _) => {}
+            (GrammarSymbol::Nonterminal(_), _) => return None,
+        }
+    }
+    Some(facts)
+}
+
+/// For each nonterminal, the classes its tree language reaches. Each
+/// (production, e-node) pair waits on its distinct child facts and fires
+/// when the last one is derived, so total work is linear in the pairs.
+fn derives_relation(egraph: &EGraph, grammar: &Grammar) -> HashMap<String, HashSet<ClassId>> {
+    let mut conclusions: Vec<(String, ClassId)> = Vec::new();
+    let mut missing: Vec<usize> = Vec::new();
+    let mut waiting: HashMap<(String, ClassId), Vec<usize>> = HashMap::new();
+    let mut ready: Vec<usize> = Vec::new();
+    for nonterminal in grammar.nonterminals() {
+        for production in grammar.productions_of(&nonterminal) {
+            let selected = selected_symbols(grammar, production);
+            let constructor = &grammar.production(production).constructor;
+            for node in egraph.nodes_of_constructor(constructor) {
+                if node.children.len() != selected.len() {
+                    continue;
                 }
+                let Some(facts) = requirements(&selected, node) else {
+                    continue;
+                };
+                let pair = conclusions.len();
+                conclusions.push((nonterminal.clone(), node.class.clone()));
+                missing.push(facts.len());
+                if facts.is_empty() {
+                    ready.push(pair);
+                }
+                for fact in facts {
+                    waiting.entry(fact).or_default().push(pair);
+                }
+            }
+        }
+    }
+    let mut derives: HashMap<String, HashSet<ClassId>> = HashMap::new();
+    while let Some(pair) = ready.pop() {
+        let (nonterminal, class) = conclusions[pair].clone();
+        if !derives
+            .entry(nonterminal.clone())
+            .or_default()
+            .insert(class.clone())
+        {
+            continue;
+        }
+        for waiter in waiting.remove(&(nonterminal, class)).unwrap_or_default() {
+            missing[waiter] -= 1;
+            if missing[waiter] == 0 {
+                ready.push(waiter);
             }
         }
     }
@@ -412,9 +460,9 @@ mod tests {
         let derives = derives_relation(&egraph, &grammar);
         let root_class = egraph.class_of(&root).unwrap();
         let one_class = egraph.class_of(&num(1)).unwrap();
-        assert!(derives.contains(&("Expr".into(), root_class)));
-        assert!(derives.contains(&("Expr".into(), one_class)));
-        assert_eq!(derives.len(), 3);
+        assert!(derives["Expr"].contains(&root_class));
+        assert!(derives["Expr"].contains(&one_class));
+        assert_eq!(derives["Expr"].len(), 3);
     }
 
     #[test]

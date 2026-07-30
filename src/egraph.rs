@@ -29,15 +29,30 @@ pub struct ENode {
     pub class: ClassId,
 }
 
+/// A remembered insertion: its row in the keyed table and its class value.
+struct Insertion {
+    table: String,
+    row: i64,
+    value: egglog::Value,
+}
+
+/// The loaded schema of a function: input columns and output sort.
+struct Signature {
+    columns: Option<Vec<Column>>,
+    output: String,
+}
+
 /// A live egglog engine plus an e-node index by (constructor, class),
 /// rebuilt when rules run and extended incrementally on inserts.
 pub struct EGraph {
     engine: egglog::EGraph,
-    inserted: u64,
-    named: HashMap<u64, (String, egglog::Value)>,
-    nodes_by_class: HashMap<(String, ClassId), Vec<ENode>>,
+    inserted: i64,
+    named: HashMap<u64, Insertion>,
+    tables: HashMap<String, String>,
+    signatures: HashMap<String, Signature>,
+    nodes_by_class: HashMap<String, HashMap<ClassId, Vec<ENode>>>,
     nodes_by_constructor: HashMap<String, Vec<ENode>>,
-    known_nodes: HashSet<(String, Vec<ChildValue>)>,
+    known_nodes: HashMap<String, HashSet<Vec<ChildValue>>>,
 }
 
 impl EGraph {
@@ -51,9 +66,11 @@ impl EGraph {
             engine,
             inserted: 0,
             named: HashMap::new(),
+            tables: HashMap::new(),
+            signatures: HashMap::new(),
             nodes_by_class: HashMap::new(),
             nodes_by_constructor: HashMap::new(),
-            known_nodes: HashSet::new(),
+            known_nodes: HashMap::new(),
         };
         egraph.rebuild_index();
         Ok(egraph)
@@ -68,18 +85,103 @@ impl EGraph {
         Ok(())
     }
 
-    /// Inserts a ground tree so future rule runs can involve it.
-    pub fn insert_ast(&mut self, ast: &Ast) -> Result<(), Error> {
-        self.inserted += 1;
-        let binding = format!("(let __tree_{} {})", self.inserted, ast.to_egglog());
-        self.engine
-            .parse_and_run_program(None, &binding)
+    /// Runs the loaded rules for `iterations`; true if the e-graph changed,
+    /// in which case the index is rebuilt.
+    pub fn saturate(&mut self, iterations: u32) -> Result<bool, Error> {
+        let outputs = self
+            .engine
+            .parse_and_run_program(None, &format!("(run {iterations})"))
             .map_err(|e| Error::EGraph(e.to_string()))?;
-        let mut entries = Vec::new();
-        self.engine.read(|state| {
-            collect_tree_nodes(&state, ast, &mut entries);
+        let changed = outputs.iter().any(|output| match output {
+            egglog::CommandOutput::RunSchedule(report) => report.updated,
+            _ => false,
         });
-        for (constructor, children, class) in entries {
+        if changed {
+            self.rebuild_index();
+        }
+        Ok(changed)
+    }
+
+    /// Inserts a ground tree so future rule runs can involve it; leaves alone
+    /// add nothing. One shallow command per node, so depth is unbounded.
+    pub fn insert_ast(&mut self, ast: &Ast) -> Result<(), Error> {
+        enum Task<'a> {
+            Visit(&'a Ast),
+            Build(&'a str, usize),
+        }
+        enum Planned {
+            Row(i64, String),
+            Number(i64),
+            Text(String),
+        }
+        if !matches!(ast, Ast::Constructor { .. }) {
+            return Ok(());
+        }
+        let mut plan: Vec<(String, i64, String, Vec<Planned>)> = Vec::new();
+        let mut results: Vec<Planned> = Vec::new();
+        let mut tasks = vec![Task::Visit(ast)];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Visit(Ast::Number(n)) => results.push(Planned::Number(*n)),
+                Task::Visit(Ast::Text(s)) => results.push(Planned::Text(s.clone())),
+                Task::Visit(Ast::Constructor { name, children }) => {
+                    tasks.push(Task::Build(name, children.len()));
+                    for child in children.iter().rev() {
+                        tasks.push(Task::Visit(child));
+                    }
+                }
+                Task::Build(name, arity) => {
+                    let children = results.split_off(results.len() - arity);
+                    let table = self.table_for(name)?;
+                    self.inserted += 1;
+                    let row = self.inserted;
+                    plan.push((table.clone(), row, name.to_string(), children));
+                    results.push(Planned::Row(row, table));
+                }
+            }
+        }
+        let mut program = String::new();
+        for (table, row, constructor, children) in &plan {
+            program.push_str(&format!("(set ({table} {row}) ({constructor}"));
+            for child in children {
+                program.push(' ');
+                match child {
+                    Planned::Row(child_row, child_table) => {
+                        program.push_str(&format!("({child_table} {child_row})"))
+                    }
+                    Planned::Number(n) => program.push_str(&n.to_string()),
+                    Planned::Text(s) => program.push_str(&Ast::Text(s.clone()).to_egglog()),
+                }
+            }
+            program.push_str("))\n");
+        }
+        self.engine
+            .parse_and_run_program(None, &program)
+            .map_err(|e| Error::EGraph(e.to_string()))?;
+        let mut classes: HashMap<i64, egglog::Value> = HashMap::new();
+        self.engine.read(|state| {
+            for (table, row, _, _) in &plan {
+                let row_value = state.base_to_value::<i64>(*row);
+                if let Ok(Some(value)) =
+                    state.lookup(table.as_str(), egglog::RawValues(vec![row_value]))
+                {
+                    classes.insert(*row, value);
+                }
+            }
+        });
+        if classes.len() != plan.len() {
+            return Err(Error::EGraph("inserted tree not found".to_string()));
+        }
+        for (_, row, constructor, children) in plan {
+            let children = children
+                .into_iter()
+                .map(|child| match child {
+                    Planned::Row(child_row, _) => ChildValue::Class(class_id(classes[&child_row])),
+                    Planned::Number(n) => ChildValue::Number(n),
+                    Planned::Text(s) => ChildValue::Text(s),
+                })
+                .collect();
+            let class = class_id(classes[&row]);
             self.add_to_index(&constructor, ENode { children, class });
         }
         Ok(())
@@ -93,56 +195,55 @@ impl EGraph {
         constructor: &str,
         children: &[InsertRef],
     ) -> Result<(), Error> {
-        let name = format!("__node_{key}");
-        let mut rendered = format!("(let {name} ({constructor}");
+        let table = self.table_for(constructor)?;
+        self.inserted += 1;
+        let row = self.inserted;
+        let mut command = format!("(set ({table} {row}) ({constructor}");
+        let mut child_values = Vec::with_capacity(children.len());
         for child in children {
-            rendered.push(' ');
+            command.push(' ');
             match child {
                 InsertRef::Node(child_key) => match self.named.get(child_key) {
-                    Some((child_name, _)) => rendered.push_str(child_name),
+                    Some(insertion) => {
+                        command.push_str(&format!("({} {})", insertion.table, insertion.row));
+                        child_values.push(ChildValue::Class(class_id(insertion.value)));
+                    }
                     None => return Err(Error::EGraph(format!("unknown insertion {child_key}"))),
                 },
-                InsertRef::Number(n) => rendered.push_str(&Ast::Number(*n).to_egglog()),
-                InsertRef::Text(s) => rendered.push_str(&Ast::Text(s.clone()).to_egglog()),
+                InsertRef::Number(n) => {
+                    command.push_str(&n.to_string());
+                    child_values.push(ChildValue::Number(*n));
+                }
+                InsertRef::Text(s) => {
+                    command.push_str(&Ast::Text(s.clone()).to_egglog());
+                    child_values.push(ChildValue::Text(s.clone()));
+                }
             }
         }
-        rendered.push_str("))");
+        command.push_str("))");
         self.engine
-            .parse_and_run_program(None, &rendered)
+            .parse_and_run_program(None, &command)
             .map_err(|e| Error::EGraph(e.to_string()))?;
-        let (child_values, class_value) = self.engine.read(|state| {
-            let values: Vec<egglog::Value> = children
-                .iter()
-                .map(|child| match child {
-                    InsertRef::Node(child_key) => self.named[child_key].1,
-                    InsertRef::Number(n) => state.base_to_value::<i64>(*n),
-                    InsertRef::Text(s) => {
-                        state.base_to_value::<egglog::sort::S>(s.clone().into())
-                    }
-                })
-                .collect();
-            let child_values: Vec<ChildValue> = children
-                .iter()
-                .map(|child| match child {
-                    InsertRef::Node(child_key) => {
-                        ChildValue::Class(class_id(self.named[child_key].1))
-                    }
-                    InsertRef::Number(n) => ChildValue::Number(*n),
-                    InsertRef::Text(s) => ChildValue::Text(s.clone()),
-                })
-                .collect();
-            let class_value = state
-                .eclass_of(constructor, egglog::RawValues(values))
+        let class_value = self.engine.read(|state| {
+            let row_value = state.base_to_value::<i64>(row);
+            state
+                .lookup(table.as_str(), egglog::RawValues(vec![row_value]))
                 .ok()
-                .flatten();
-            (child_values, class_value)
+                .flatten()
         });
         let Some(class_value) = class_value else {
             return Err(Error::EGraph(format!(
                 "insertion of {constructor} not found"
             )));
         };
-        self.named.insert(key, (name, class_value));
+        self.named.insert(
+            key,
+            Insertion {
+                table,
+                row,
+                value: class_value,
+            },
+        );
         let node = ENode {
             children: child_values,
             class: class_id(class_value),
@@ -157,53 +258,113 @@ impl EGraph {
         match ast {
             Ast::Constructor { .. } => self
                 .engine
-                .read(|state| evaluate_to_value(&state, ast).map(class_id)),
+                .read(|state| tree_value(&state, ast).map(class_id)),
             _ => None,
         }
     }
 
     /// E-nodes of one constructor whose class is `class`.
-    pub fn nodes_in_class(&self, constructor: &str, class: &ClassId) -> Vec<ENode> {
+    pub fn nodes_in_class(&self, constructor: &str, class: &ClassId) -> &[ENode] {
         self.nodes_by_class
-            .get(&(constructor.to_string(), class.clone()))
-            .cloned()
-            .unwrap_or_default()
+            .get(constructor)
+            .and_then(|by_class| by_class.get(class))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// All e-nodes of one constructor.
-    pub fn nodes_of_constructor(&self, constructor: &str) -> Vec<ENode> {
+    pub fn nodes_of_constructor(&self, constructor: &str) -> &[ENode] {
         self.nodes_by_constructor
             .get(constructor)
-            .cloned()
-            .unwrap_or_default()
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The number of children of a constructor, if it is loaded and supported.
     pub fn constructor_arity(&self, constructor: &str) -> Option<usize> {
-        self.input_columns(constructor).map(|columns| columns.len())
+        self.signatures
+            .get(constructor)?
+            .columns
+            .as_ref()
+            .map(Vec::len)
     }
 
-    /// Rebuilds the whole index and re-canonicalizes remembered insertions.
+    /// The keyed table holding insertions of the constructor's sort,
+    /// declared on first use.
+    fn table_for(&mut self, constructor: &str) -> Result<String, Error> {
+        let sort = self
+            .signatures
+            .get(constructor)
+            .map(|signature| signature.output.clone())
+            .ok_or_else(|| {
+                Error::EGraph(format!("unknown or unsupported constructor {constructor}"))
+            })?;
+        if let Some(table) = self.tables.get(&sort) {
+            return Ok(table.clone());
+        }
+        let table = format!("__nodes_{sort}");
+        self.engine
+            .parse_and_run_program(None, &format!("(function {table} (i64) {sort} :no-merge)"))
+            .map_err(|e| Error::EGraph(e.to_string()))?;
+        self.tables.insert(sort, table.clone());
+        Ok(table)
+    }
+
+    /// Rebuilds the schema cache and the whole index, and re-canonicalizes
+    /// remembered insertions.
     fn rebuild_index(&mut self) {
         self.nodes_by_class.clear();
         self.nodes_by_constructor.clear();
         self.known_nodes.clear();
-        let names: Vec<String> = self
-            .engine
-            .functions_iter()
-            .filter(|(_, function)| !function.is_let_binding())
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in names {
+        self.signatures.clear();
+        let mut enumerable = Vec::new();
+        for (name, function) in self.engine.functions_iter() {
+            let schema = function.schema();
+            let columns = schema
+                .input
+                .iter()
+                .map(|sort| {
+                    if sort.is_eq_sort() {
+                        Some(Column::Class)
+                    } else if sort.name() == "i64" {
+                        Some(Column::Number)
+                    } else if sort.name() == "String" {
+                        Some(Column::Text)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.signatures.insert(
+                name.clone(),
+                Signature {
+                    columns,
+                    output: schema.output.name().to_string(),
+                },
+            );
+            let internal = self.tables.values().any(|table| table == name);
+            if !function.is_let_binding() && !internal {
+                enumerable.push(name.clone());
+            }
+        }
+        for name in enumerable {
             for node in self.all_nodes(&name) {
                 self.add_to_index(&name, node);
             }
         }
         let mut refreshed = HashMap::new();
         self.engine.read(|state| {
-            for (key, (name, _)) in &self.named {
-                if let Ok(Some(value)) = state.lookup(name.as_str(), egglog::RawValues(vec![])) {
-                    refreshed.insert(*key, (name.clone(), value));
+            for (key, insertion) in &self.named {
+                let row_value = state.base_to_value::<i64>(insertion.row);
+                if let Ok(Some(value)) =
+                    state.lookup(insertion.table.as_str(), egglog::RawValues(vec![row_value]))
+                {
+                    refreshed.insert(
+                        *key,
+                        Insertion {
+                            table: insertion.table.clone(),
+                            row: insertion.row,
+                            value,
+                        },
+                    );
                 }
             }
         });
@@ -211,14 +372,14 @@ impl EGraph {
     }
 
     fn add_to_index(&mut self, constructor: &str, node: ENode) {
-        if !self
-            .known_nodes
-            .insert((constructor.to_string(), node.children.clone()))
-        {
+        let known = self.known_nodes.entry(constructor.to_string()).or_default();
+        if !known.insert(node.children.clone()) {
             return;
         }
         self.nodes_by_class
-            .entry((constructor.to_string(), node.class.clone()))
+            .entry(constructor.to_string())
+            .or_default()
+            .entry(node.class.clone())
             .or_default()
             .push(node.clone());
         self.nodes_by_constructor
@@ -228,16 +389,20 @@ impl EGraph {
     }
 
     fn all_nodes(&self, constructor: &str) -> Vec<ENode> {
-        let Some(columns) = self.input_columns(constructor) else {
+        let Some(columns) = self
+            .signatures
+            .get(constructor)
+            .and_then(|signature| signature.columns.as_ref())
+        else {
             return Vec::new();
         };
         let mut nodes = Vec::new();
-        let _ = self.engine.read(|state| {
+        self.engine.read(|state| {
             let _ = state.constructor_enodes(constructor, |enode| {
                 let children = enode
                     .children
                     .iter()
-                    .zip(&columns)
+                    .zip(columns)
                     .map(|(&value, column)| match column {
                         Column::Class => ChildValue::Class(class_id(value)),
                         Column::Number => ChildValue::Number(state.value_to_base::<i64>(value)),
@@ -254,31 +419,6 @@ impl EGraph {
         });
         nodes
     }
-
-    /// The kind of each input column, or None if any column is unsupported.
-    fn input_columns(&self, constructor: &str) -> Option<Vec<Column>> {
-        let function = self
-            .engine
-            .functions_iter()
-            .find(|(name, _)| name.as_str() == constructor)?
-            .1;
-        function
-            .schema()
-            .input
-            .iter()
-            .map(|sort| {
-                if sort.is_eq_sort() {
-                    Some(Column::Class)
-                } else if sort.name() == "i64" {
-                    Some(Column::Number)
-                } else if sort.name() == "String" {
-                    Some(Column::Text)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
 }
 
 /// The kind of one e-node input column.
@@ -292,53 +432,38 @@ fn class_id(value: egglog::Value) -> ClassId {
     format!("{value:?}")
 }
 
-/// The engine value of a ground tree, by bottom-up lookup.
-fn evaluate_to_value(state: &egglog::ReadState<'_, '_>, ast: &Ast) -> Option<egglog::Value> {
-    match ast {
-        Ast::Number(n) => Some(state.base_to_value::<i64>(*n)),
-        Ast::Text(s) => Some(state.base_to_value::<egglog::sort::S>(s.clone().into())),
-        Ast::Constructor { name, children } => {
-            let mut child_values = Vec::with_capacity(children.len());
-            for child in children {
-                child_values.push(evaluate_to_value(state, child)?);
+/// The engine value of a ground tree, by iterative bottom-up lookup.
+fn tree_value(state: &egglog::ReadState<'_, '_>, ast: &Ast) -> Option<egglog::Value> {
+    enum Task<'a> {
+        Visit(&'a Ast),
+        Build(&'a str, usize),
+    }
+    let mut values: Vec<egglog::Value> = Vec::new();
+    let mut tasks = vec![Task::Visit(ast)];
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Visit(Ast::Number(n)) => values.push(state.base_to_value::<i64>(*n)),
+            Task::Visit(Ast::Text(s)) => {
+                values.push(state.base_to_value::<egglog::sort::S>(s.clone().into()))
             }
-            state
-                .eclass_of(name, egglog::RawValues(child_values))
-                .ok()
-                .flatten()
+            Task::Visit(Ast::Constructor { name, children }) => {
+                tasks.push(Task::Build(name, children.len()));
+                for child in children.iter().rev() {
+                    tasks.push(Task::Visit(child));
+                }
+            }
+            Task::Build(name, arity) => {
+                let child_values = values.split_off(values.len() - arity);
+                values.push(
+                    state
+                        .eclass_of(name, egglog::RawValues(child_values))
+                        .ok()
+                        .flatten()?,
+                );
+            }
         }
     }
-}
-
-/// Bottom-up over the tree: record each constructor node and return its
-/// engine value and its indexable child form.
-fn collect_tree_nodes(
-    state: &egglog::ReadState<'_, '_>,
-    ast: &Ast,
-    entries: &mut Vec<(String, Vec<ChildValue>, ClassId)>,
-) -> Option<(egglog::Value, ChildValue)> {
-    match ast {
-        Ast::Number(n) => Some((state.base_to_value::<i64>(*n), ChildValue::Number(*n))),
-        Ast::Text(s) => Some((
-            state.base_to_value::<egglog::sort::S>(s.clone().into()),
-            ChildValue::Text(s.clone()),
-        )),
-        Ast::Constructor { name, children } => {
-            let mut values = Vec::with_capacity(children.len());
-            let mut child_values = Vec::with_capacity(children.len());
-            for child in children {
-                let (value, child_value) = collect_tree_nodes(state, child, entries)?;
-                values.push(value);
-                child_values.push(child_value);
-            }
-            let class = state
-                .eclass_of(name, egglog::RawValues(values))
-                .ok()
-                .flatten()?;
-            entries.push((name.clone(), child_values, class_id(class)));
-            Some((class, ChildValue::Class(class_id(class))))
-        }
-    }
+    values.pop()
 }
 
 #[cfg(test)]
@@ -419,6 +544,16 @@ mod tests {
     }
 
     #[test]
+    fn saturate_reports_change_then_quiescence() {
+        let mut egraph = with_root();
+        egraph
+            .run_program("(rewrite (Add x y) (Add y x))")
+            .unwrap();
+        assert!(egraph.saturate(5).unwrap());
+        assert!(!egraph.saturate(5).unwrap());
+    }
+
+    #[test]
     fn insertions_by_reference_match_whole_trees() {
         let mut egraph = with_root();
         egraph
@@ -430,6 +565,34 @@ mod tests {
         assert!(egraph.class_of(&add(num(3), num(3))).is_some());
         let three_class = egraph.class_of(&num(3)).unwrap();
         assert!(!egraph.nodes_in_class("Num", &three_class).is_empty());
+    }
+
+    #[test]
+    fn insertions_survive_unions_and_rule_runs() {
+        let mut egraph = with_root();
+        egraph
+            .insert_node(1, "Num", &[InsertRef::Number(3)])
+            .unwrap();
+        egraph.run_program("(union (Num 3) (Num 1))").unwrap();
+        egraph
+            .insert_node(2, "Add", &[InsertRef::Node(1), InsertRef::Node(1)])
+            .unwrap();
+        assert_eq!(
+            egraph.class_of(&add(num(3), num(3))),
+            egraph.class_of(&add(num(1), num(1)))
+        );
+    }
+
+    #[test]
+    fn deep_trees_do_not_overflow_the_stack() {
+        let mut egraph = EGraph::new(ARITH).unwrap();
+        let mut tree = num(5000);
+        for i in (0..5000).rev() {
+            tree = add(num(i), tree);
+        }
+        egraph.insert_ast(&tree).unwrap();
+        assert!(egraph.class_of(&tree).is_some());
+        assert_eq!(tree.to_egglog().matches("(Add").count(), 5000);
     }
 
     #[test]

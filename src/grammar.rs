@@ -68,7 +68,7 @@ pub enum GrammarError {
 pub struct Grammar {
     start: String,
     productions: Vec<Production>,
-    prediction: HashMap<(String, String), ProductionId>,
+    prediction: HashMap<String, HashMap<String, ProductionId>>,
 }
 
 impl Grammar {
@@ -106,7 +106,7 @@ impl Grammar {
         }
         reject_left_recursion(&productions)?;
         let starting = first_kinds(&productions);
-        let mut prediction = HashMap::new();
+        let mut prediction: HashMap<String, HashMap<String, ProductionId>> = HashMap::new();
         for (id, production) in productions.iter().enumerate() {
             let kinds: Vec<String> = match &production.symbols[0] {
                 GrammarSymbol::LexemeKind(kind) => vec![kind.clone()],
@@ -115,8 +115,8 @@ impl Grammar {
                 }
             };
             for kind in kinds {
-                let key = (production.nonterminal.clone(), kind.clone());
-                if prediction.insert(key, id).is_some() {
+                let row = prediction.entry(production.nonterminal.clone()).or_default();
+                if row.insert(kind.clone(), id).is_some() {
                     return Err(GrammarError::NotLl1 {
                         nonterminal: production.nonterminal.clone(),
                         kind,
@@ -162,9 +162,7 @@ impl Grammar {
 
     /// The unique production to expand `nonterminal` with on seeing `kind`.
     pub fn predict(&self, nonterminal: &str, kind: &str) -> Option<ProductionId> {
-        self.prediction
-            .get(&(nonterminal.to_string(), kind.to_string()))
-            .copied()
+        self.prediction.get(nonterminal)?.get(kind).copied()
     }
 }
 

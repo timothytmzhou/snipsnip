@@ -15,32 +15,41 @@ impl Ast {
         }
     }
 
-    /// Renders this tree as an egglog expression.
+    /// Renders this tree as an egglog expression, without recursion.
     pub fn to_egglog(&self) -> String {
-        match self {
-            Ast::Number(value) => value.to_string(),
-            Ast::Text(value) => {
-                let mut rendered = String::from("\"");
-                for character in value.chars() {
-                    match character {
-                        '"' => rendered.push_str("\\\""),
-                        '\\' => rendered.push_str("\\\\"),
-                        other => rendered.push(other),
+        enum Task<'a> {
+            Node(&'a Ast),
+            Text(&'static str),
+        }
+        let mut rendered = String::new();
+        let mut tasks = vec![Task::Node(self)];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Text(text) => rendered.push_str(text),
+                Task::Node(Ast::Number(value)) => rendered.push_str(&value.to_string()),
+                Task::Node(Ast::Text(value)) => {
+                    rendered.push('"');
+                    for character in value.chars() {
+                        match character {
+                            '"' => rendered.push_str("\\\""),
+                            '\\' => rendered.push_str("\\\\"),
+                            other => rendered.push(other),
+                        }
+                    }
+                    rendered.push('"');
+                }
+                Task::Node(Ast::Constructor { name, children }) => {
+                    rendered.push('(');
+                    rendered.push_str(name);
+                    tasks.push(Task::Text(")"));
+                    for child in children.iter().rev() {
+                        tasks.push(Task::Node(child));
+                        tasks.push(Task::Text(" "));
                     }
                 }
-                rendered.push('"');
-                rendered
-            }
-            Ast::Constructor { name, children } => {
-                let mut rendered = format!("({name}");
-                for child in children {
-                    rendered.push(' ');
-                    rendered.push_str(&child.to_egglog());
-                }
-                rendered.push(')');
-                rendered
             }
         }
+        rendered
     }
 }
 

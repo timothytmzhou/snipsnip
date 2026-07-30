@@ -6,4 +6,3 @@ resolver = "1"
 
 [dependencies]
 egglog = { git = "https://github.com/egraphs-good/egglog", rev = "53b9721b9706741edff2b7c1e379fc37137184d9" }
-syn = { version = "2", features = ["full"] }

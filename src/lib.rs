@@ -96,9 +96,13 @@ impl PrefixSpace {
         self.matcher.realizable()
     }
 
-    /// Runs the loaded rules for `iterations` and refreshes the match state.
+    /// Runs the loaded rules for `iterations`; the match state is refreshed
+    /// only if the e-graph changed.
     pub fn saturate(&mut self, iterations: u32) -> Result<(), Error> {
-        self.run_program(&format!("(run {iterations})"))
+        if self.egraph.saturate(iterations)? {
+            self.matcher.refresh(&self.egraph, &self.grammar);
+        }
+        Ok(())
     }
 
     /// Runs egglog commands and refreshes the match state.

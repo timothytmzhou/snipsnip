@@ -1091,7 +1091,6 @@ name = "realizability"
 version = "0.1.0"
 dependencies = [
  "egglog",
- "syn 2.0.119",
 ]
 
 [[package]]
