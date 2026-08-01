@@ -12,6 +12,8 @@ mod live;
 pub mod paper_pwz;
 mod prefix_output;
 mod pwz;
+#[allow(dead_code, reason = "staged adapter is integrated in a later change")]
+mod pwz_grammar;
 mod realizability;
 
 pub use grammar::{
