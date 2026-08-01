@@ -1,27 +1,27 @@
 use std::sync::Arc;
 
-use egglog::Value;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 
 use crate::{
     dataflow::DeltaEngine,
+    egglog_backend::ValueId,
     forest::{ContextId, MemoId, SpaceId},
     grammar::{RuntimeInput, TerminalId},
 };
 
 pub(crate) type SortId = usize;
 pub(crate) type ConstructorId = usize;
-type ContinuationOutputIndex = HashMap<(Value, Option<usize>), Vec<usize>>;
-type ContinuationChildIndex = HashMap<(Value, Option<usize>), Vec<usize>>;
-type ValueSet = SmallVec<[Value; 4]>;
+type ContinuationOutputIndex = HashMap<(ValueId, Option<usize>), Vec<usize>>;
+type ContinuationChildIndex = HashMap<(ValueId, Option<usize>), Vec<usize>>;
+type ValueSet = SmallVec<[ValueId; 4]>;
 
-const NO_VALUE: Value = Value::new_const(u32::MAX);
+const NO_VALUE: ValueId = ValueId::NONE;
 const WIDE_ROW_THRESHOLD: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 struct ValueCell {
-    first: Value,
+    first: ValueId,
     rest: u32,
 }
 
@@ -36,7 +36,7 @@ impl Default for ValueCell {
 
 #[derive(Clone, Copy, Debug)]
 struct ValueEdge {
-    value: Value,
+    value: ValueId,
     next: u32,
 }
 
@@ -50,12 +50,12 @@ struct CompactValueRelation {
     edges: Vec<ValueEdge>,
     /// Membership acceleration for the exceptional high-cardinality rows.
     /// Common zero/one-value rows still cost only one eight-byte `ValueCell`.
-    wide_rows: HashMap<usize, HashSet<Value>>,
+    wide_rows: HashMap<usize, HashSet<ValueId>>,
     pairs: usize,
 }
 
 impl CompactValueRelation {
-    fn insert(&mut self, index: usize, value: Value) -> bool {
+    fn insert(&mut self, index: usize, value: ValueId) -> bool {
         if self.cells.len() <= index {
             self.cells.resize(index + 1, ValueCell::default());
         }
@@ -102,7 +102,7 @@ impl CompactValueRelation {
         true
     }
 
-    fn push_edge(&mut self, index: usize, value: Value, next: u32) {
+    fn push_edge(&mut self, index: usize, value: ValueId, next: u32) {
         let edge =
             u32::try_from(self.edges.len()).expect("realizability relation capacity exceeded");
         self.edges.push(ValueEdge { value, next });
@@ -110,7 +110,7 @@ impl CompactValueRelation {
         self.pairs = self.pairs.saturating_add(1);
     }
 
-    fn contains(&self, index: usize, value: Value) -> bool {
+    fn contains(&self, index: usize, value: ValueId) -> bool {
         let Some(cell) = self.cells.get(index).copied() else {
             return false;
         };
@@ -224,8 +224,8 @@ pub(crate) struct ConstructorSchema {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Enode {
-    output: Value,
-    children: Arc<[Value]>,
+    output: ValueId,
+    children: Arc<[ValueId]>,
 }
 
 #[derive(Clone, Debug)]
@@ -297,17 +297,17 @@ enum Event {
     Produces {
         sort: SortId,
         space: SpaceId,
-        value: Value,
+        value: ValueId,
     },
     RealizableForMemo {
         sort: SortId,
         memo: u32,
-        value: Value,
+        value: ValueId,
     },
     RealizableForContext {
         sort: SortId,
         context: u32,
-        value: Value,
+        value: ValueId,
     },
     RealizableMemo(u32),
     RealizableContext(u32),
@@ -327,9 +327,9 @@ pub(crate) struct RealizabilityEngine {
 
     enodes: Vec<Vec<Enode>>,
     enode_seen: Vec<HashSet<Enode>>,
-    enodes_by_output: Vec<HashMap<Value, Vec<usize>>>,
-    enodes_by_child: Vec<Vec<HashMap<Value, Vec<usize>>>>,
-    domains: Vec<HashMap<Value, DomainValue>>,
+    enodes_by_output: Vec<HashMap<ValueId, Vec<usize>>>,
+    enodes_by_child: Vec<Vec<HashMap<ValueId, Vec<usize>>>>,
+    domains: Vec<HashMap<ValueId, DomainValue>>,
 
     produces: Vec<CompactValueRelation>,
     aliases_by_child: DenseAdjacency<SpaceId>,
@@ -337,10 +337,10 @@ pub(crate) struct RealizabilityEngine {
     space_application_children: Vec<SpaceId>,
     space_apps_by_constructor: Vec<Vec<usize>>,
     space_uses: Vec<DenseAdjacency<(usize, usize)>>,
-    space_apps_by_child: Vec<Vec<HashMap<Value, Vec<usize>>>>,
+    space_apps_by_child: Vec<Vec<HashMap<ValueId, Vec<usize>>>>,
 
     token_any: Vec<Vec<SpaceId>>,
-    exact_tokens: Vec<HashMap<Value, Vec<SpaceId>>>,
+    exact_tokens: Vec<HashMap<ValueId, Vec<SpaceId>>>,
 
     realizable_for_memos: Vec<CompactValueRelation>,
     realizable_for_contexts: Vec<CompactValueRelation>,
@@ -359,7 +359,7 @@ pub(crate) struct RealizabilityEngine {
     continuations_by_output: Vec<ContinuationOutputIndex>,
     continuations_by_child: Vec<Vec<ContinuationChildIndex>>,
 
-    targets: Vec<HashSet<Value>>,
+    targets: Vec<HashSet<ValueId>>,
     delta: DeltaEngine<Event>,
     last_join_probes: usize,
     total_join_probes: usize,
@@ -477,7 +477,7 @@ impl RealizabilityEngine {
         self.total_join_probes
     }
 
-    pub(crate) fn add_target(&mut self, sort: SortId, value: Value) {
+    pub(crate) fn add_target(&mut self, sort: SortId, value: ValueId) {
         if self.targets[sort].insert(value) {
             self.insert_realizable_for_context(sort, 0, value);
         }
@@ -491,7 +491,7 @@ impl RealizabilityEngine {
 
     pub(crate) fn frontier_viable(
         &self,
-        lexeme_values: &[(SortId, Value)],
+        lexeme_values: &[(SortId, ValueId)],
         memos: impl Iterator<Item = MemoId>,
     ) -> bool {
         memos.into_iter().any(|memo| {
@@ -506,8 +506,8 @@ impl RealizabilityEngine {
     pub(crate) fn add_enode(
         &mut self,
         constructor: ConstructorId,
-        output: Value,
-        children: Vec<Value>,
+        output: ValueId,
+        children: Vec<ValueId>,
     ) {
         debug_assert_eq!(children.len(), self.constructors[constructor].inputs.len());
         let enode = Enode {
@@ -536,7 +536,7 @@ impl RealizabilityEngine {
     pub(crate) fn add_domain(
         &mut self,
         sort: SortId,
-        value: Value,
+        value: ValueId,
         lexical_form: String,
         integer: Option<i64>,
     ) {
@@ -631,7 +631,7 @@ impl RealizabilityEngine {
         }
     }
 
-    pub(crate) fn add_token_exact(&mut self, sort: SortId, output: SpaceId, value: Value) {
+    pub(crate) fn add_token_exact(&mut self, sort: SortId, output: SpaceId, value: ValueId) {
         self.exact_tokens[sort]
             .entry(value)
             .or_default()
@@ -1129,21 +1129,21 @@ impl RealizabilityEngine {
         }
     }
 
-    fn insert_produces(&mut self, sort: SortId, space: SpaceId, value: Value) {
+    fn insert_produces(&mut self, sort: SortId, space: SpaceId, value: ValueId) {
         if self.produces[sort].insert(space.index(), value) {
             self.delta
                 .enqueue_new(Event::Produces { sort, space, value });
         }
     }
 
-    fn insert_realizable_for_memo(&mut self, sort: SortId, memo: u32, value: Value) {
+    fn insert_realizable_for_memo(&mut self, sort: SortId, memo: u32, value: ValueId) {
         if self.realizable_for_memos[sort].insert(memo as usize, value) {
             self.delta
                 .enqueue_new(Event::RealizableForMemo { sort, memo, value });
         }
     }
 
-    fn insert_realizable_for_context(&mut self, sort: SortId, context: u32, value: Value) {
+    fn insert_realizable_for_context(&mut self, sort: SortId, context: u32, value: ValueId) {
         if self.realizable_for_contexts[sort].insert(context as usize, value) {
             self.delta.enqueue_new(Event::RealizableForContext {
                 sort,
@@ -1170,7 +1170,7 @@ impl RealizabilityEngine {
         self.total_join_probes = self.total_join_probes.saturating_add(1);
     }
 
-    fn produces(&self, sort: SortId, space: SpaceId, value: Value) -> bool {
+    fn produces(&self, sort: SortId, space: SpaceId, value: ValueId) -> bool {
         self.produces[sort].contains(space.index(), value)
     }
 
@@ -1191,7 +1191,7 @@ impl RealizabilityEngine {
 mod tests {
     use std::mem::size_of;
 
-    use egglog::Value;
+    use crate::egglog_backend::ValueId;
 
     use super::{CompactValueRelation, ValueCell, WIDE_ROW_THRESHOLD};
 
@@ -1200,15 +1200,15 @@ mod tests {
         assert_eq!(size_of::<ValueCell>(), 8);
         let mut relation = CompactValueRelation::default();
         for raw in 0..10 {
-            assert!(relation.insert(7, Value::new_const(raw)));
-            assert!(!relation.insert(7, Value::new_const(raw)));
+            assert!(relation.insert(7, ValueId::from_raw_for_test(raw)));
+            assert!(!relation.insert(7, ValueId::from_raw_for_test(raw)));
         }
         assert_eq!(relation.pair_count(), 10);
         for raw in 0..10 {
-            assert!(relation.contains(7, Value::new_const(raw)));
+            assert!(relation.contains(7, ValueId::from_raw_for_test(raw)));
         }
-        assert!(!relation.contains(6, Value::new_const(0)));
-        assert!(!relation.contains(7, Value::new_const(11)));
+        assert!(!relation.contains(6, ValueId::from_raw_for_test(0)));
+        assert!(!relation.contains(7, ValueId::from_raw_for_test(11)));
         assert!(relation.wide_rows.contains_key(&7));
     }
 
@@ -1216,13 +1216,13 @@ mod tests {
     fn compact_relation_promotes_only_wide_rows_to_hash_membership() {
         let mut relation = CompactValueRelation::default();
         for raw in 0..WIDE_ROW_THRESHOLD as u32 {
-            assert!(relation.insert(1, Value::new_const(raw)));
+            assert!(relation.insert(1, ValueId::from_raw_for_test(raw)));
         }
         assert!(!relation.wide_rows.contains_key(&1));
-        assert!(relation.insert(1, Value::new_const(WIDE_ROW_THRESHOLD as u32)));
+        assert!(relation.insert(1, ValueId::from_raw_for_test(WIDE_ROW_THRESHOLD as u32)));
         assert!(relation.wide_rows.contains_key(&1));
 
-        assert!(relation.insert(2, Value::new_const(99)));
+        assert!(relation.insert(2, ValueId::from_raw_for_test(99)));
         assert!(!relation.wide_rows.contains_key(&2));
     }
 }

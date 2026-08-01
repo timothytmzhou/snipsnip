@@ -4,6 +4,7 @@
 mod core;
 mod dataflow;
 mod disjoint;
+mod egglog_backend;
 mod fixed_tree;
 mod forest;
 mod grammar;

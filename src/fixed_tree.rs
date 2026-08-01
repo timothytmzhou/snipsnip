@@ -5,7 +5,7 @@
 //! can be recursive or infinite. They are deliberately ignored here. Every
 //! later exact-token/application/ambiguity space denotes concrete parsed
 //! trees. This module incrementally turns those fixed trees into private
-//! egglog bindings.
+//! backend bindings.
 //!
 //! Bindings form a DAG: a constructor request contains only the binding IDs of
 //! its immediate children. Consequently the request size is proportional to
@@ -41,7 +41,7 @@ impl FixedSpaceId {
     }
 }
 
-/// One private global egglog binding. IDs are stable, dense, and allocated in
+/// One private backend binding. IDs are stable, dense, and allocated in
 /// dependency order, so every child named by a constructor has a lower ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct BindingId(u32);
@@ -51,20 +51,11 @@ impl BindingId {
     pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
-
-    /// Returns the egglog global name for this binding.
-    pub(crate) fn egglog_name(self, private_prefix: &str) -> String {
-        format!(
-            "${}_fixed_tree_{}",
-            private_prefix.trim_start_matches('$'),
-            self.0
-        )
-    }
 }
 
 /// A primitive exact-token term. Keeping this typed source, rather than only
-/// its eventual egglog `Value`, lets the caller construct a normal `(let ...)`
-/// command which later constructor bindings can reference.
+/// its eventual backend value, lets the backend construct a binding which
+/// later constructor bindings can reference.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ExactSource {
     String(Arc<str>),
@@ -105,19 +96,13 @@ pub(crate) enum BindingRhs {
     },
 }
 
-/// Work for the owning `live.rs`: insert this private binding, evaluate its
-/// variable, and return the resulting value from the drain callback.
+/// Work for the semantic backend: insert this private binding, evaluate it,
+/// and return the resulting value from the drain callback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingBinding {
     pub(crate) binding: BindingId,
     pub(crate) sort: SortId,
     pub(crate) rhs: BindingRhs,
-}
-
-impl PendingBinding {
-    pub(crate) fn egglog_name(&self, private_prefix: &str) -> String {
-        self.binding.egglog_name(private_prefix)
-    }
 }
 
 /// A newly established typed concrete candidate for a fixed space.
@@ -185,8 +170,8 @@ struct SpaceValue<Value> {
 
 /// Incrementally materializes only dynamic, concrete PwZ spaces.
 ///
-/// `Value` is normally `egglog::Value`; tests and other clients may use any
-/// cheap hashable value. Values returned by the evaluator are used to suppress
+/// `Value` is any cheap hashable backend handle. Values returned by the
+/// evaluator are used to suppress
 /// equivalent candidates before computing constructor cross-products.
 pub(crate) struct FixedTreeMaterializer<Value>
 where
@@ -458,7 +443,7 @@ where
 
     /// Appends and clears candidate deltas accumulated since the previous
     /// drain. Alias propagation emits the same binding for the new space and
-    /// never asks egglog to rebuild that term.
+    /// never asks the backend to rebuild that term.
     pub(crate) fn drain_materialized(&mut self, output: &mut Vec<MaterializedCandidate<Value>>) {
         output.append(&mut self.materialized);
     }
@@ -503,7 +488,7 @@ where
     ///
     /// Prefix-output reconstruction uses this for the shallow node created
     /// while a concrete value is passed through one zipper context. Children
-    /// are existing bindings, so the pending egglog request remains constant
+    /// are existing bindings, so the pending backend request remains constant
     /// depth regardless of the total AST depth.
     pub(crate) fn intern_detached_constructor(
         &mut self,
@@ -857,10 +842,6 @@ mod tests {
         assert!(requests.iter().any(|request| {
             request.sort == 1 && request.rhs == BindingRhs::Exact(ExactSource::I64(42))
         }));
-        assert_eq!(
-            requests[0].egglog_name("__private"),
-            "$__private_fixed_tree_0"
-        );
     }
 
     #[test]
