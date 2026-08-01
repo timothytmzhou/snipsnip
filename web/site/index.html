@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Explore prefixspace: incremental syntax and equality-saturation analysis for every source prefix."
+    />
+    <meta name="theme-color" content="#0b1017" />
+    <title>prefixspace — streaming program analysis</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#source-input">Skip to source input</a>
+
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="prefixspace demo home">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span class="brand-name">prefixspace</span>
+        <span class="brand-tag">live demo</span>
+      </a>
+
+      <div class="header-links">
+        <a href="https://github.com/timothytmzhou/snipsnip" target="_blank" rel="noreferrer">
+          Source
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M5.25 3.75h7v7M12 4 4 12" />
+          </svg>
+        </a>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <div class="eyebrow"><span></span> Interactive prefix analysis</div>
+        <h1 id="page-title">Know whether the code you are typing can still work.</h1>
+        <p>
+          Each lexeme advances a parser zipper, then checks its possible completions against a
+          focused egglog e-graph. Green has a valid completion. Red has a proof that none exists.
+          Gray means the analysis cannot yet decide.
+        </p>
+      </section>
+
+      <section class="workspace" aria-label="Interactive analyzer">
+        <article class="editor-panel egglog-panel">
+          <header class="panel-header">
+            <div>
+              <div class="panel-kicker">Analysis</div>
+              <h2>Egglog program</h2>
+            </div>
+            <button class="quiet-button" id="reset-program" type="button">Reset</button>
+          </header>
+
+          <div class="editor-shell">
+            <div class="editor-bar" aria-hidden="true">
+              <span></span><span></span><span></span>
+              <span class="editor-filename">types.egg</span>
+            </div>
+            <label class="sr-only" for="egglog-program">Editable Egglog program</label>
+            <textarea
+              id="egglog-program"
+              name="egglog-program"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+              wrap="off"
+            ></textarea>
+          </div>
+
+          <footer class="panel-footer">
+            <span><kbd>⌘</kbd><kbd>Enter</kbd> run now</span>
+            <span>Target <code>$required</code></span>
+          </footer>
+        </article>
+
+        <article class="editor-panel source-panel">
+          <header class="panel-header">
+            <div>
+              <div class="panel-kicker">Stream</div>
+              <h2>TypeScript prefix</h2>
+            </div>
+            <div class="sample-actions" aria-label="Load a sample">
+              <button class="sample-button sample-valid" id="sample-valid" type="button">
+                <span aria-hidden="true">✓</span> Valid
+              </button>
+              <button class="sample-button sample-invalid" id="sample-invalid" type="button">
+                <span aria-hidden="true">×</span> Invalid
+              </button>
+            </div>
+          </header>
+
+          <div class="source-editor">
+            <label for="source-input">Source is analyzed again as you type</label>
+            <textarea
+              id="source-input"
+              name="source-input"
+              rows="5"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+            ></textarea>
+            <div class="source-caret" aria-hidden="true"></div>
+          </div>
+
+          <div class="live-summary" aria-live="polite" aria-atomic="true">
+            <div class="status-badge status-loading" id="overall-status">
+              <span class="status-icon" aria-hidden="true"></span>
+              <span id="overall-status-label">Loading engine</span>
+            </div>
+            <div class="summary-time">
+              <span>Total analysis</span>
+              <strong id="total-time">—</strong>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="trace-panel" aria-labelledby="trace-title">
+        <header class="trace-header">
+          <div>
+            <div class="panel-kicker">Lexeme trace</div>
+            <h2 id="trace-title">The answer at every prefix</h2>
+          </div>
+          <div class="legend" aria-label="Status legend">
+            <span><i class="legend-dot realizable"></i>Realizable</span>
+            <span><i class="legend-dot unrealizable"></i>Unrealizable</span>
+            <span><i class="legend-dot unknown"></i>Unknown</span>
+          </div>
+        </header>
+
+        <div class="token-strip" id="token-strip" aria-live="polite">
+          <div class="token-empty" id="token-empty">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            Waiting for the analyzer…
+          </div>
+        </div>
+        <p class="trace-hint" id="trace-hint">
+          Select a token to put the editor at that exact prefix.
+        </p>
+      </section>
+
+      <section class="error-panel" id="error-panel" role="alert" hidden>
+        <div class="error-icon" aria-hidden="true">!</div>
+        <div>
+          <h2>Analyzer error</h2>
+          <pre id="error-message"></pre>
+        </div>
+        <button class="quiet-button" id="dismiss-error" type="button">Dismiss</button>
+      </section>
+
+      <section class="how-it-works" aria-labelledby="how-title">
+        <div>
+          <div class="panel-kicker">Under the hood</div>
+          <h2 id="how-title">One live intersection, updated from both sides.</h2>
+        </div>
+        <ol>
+          <li>
+            <span>01</span>
+            <div><strong>Derive</strong><p>The parser zipper advances by one complete lexeme.</p></div>
+          </li>
+          <li>
+            <span>02</span>
+            <div><strong>Focus</strong><p>Only e-classes touching the current prefix are saturated.</p></div>
+          </li>
+          <li>
+            <span>03</span>
+            <div><strong>Decide</strong><p>An equality witness or a disjointness proof yields the result.</p></div>
+          </li>
+        </ol>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>Runs locally in your browser via Rust + WebAssembly.</span>
+      <span>No source code leaves this page.</span>
+    </footer>
+
+    <noscript>
+      <div class="noscript">This demo needs JavaScript to run the WebAssembly analyzer.</div>
+    </noscript>
+  </body>
+</html>

@@ -1,1 +1,7 @@
-/target
+/target/
+/dist/
+/web/pkg/
+/web/site/pkg/
+/web/target/
+/.web-smoke/
+.DS_Store
