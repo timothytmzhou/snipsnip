@@ -1130,6 +1130,7 @@ dependencies = [
 name = "prefixspace-web"
 version = "0.1.0"
 dependencies = [
+ "egglog",
  "getrandom 0.3.4",
  "prefixspace",
  "serde",
