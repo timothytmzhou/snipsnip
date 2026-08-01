@@ -11,6 +11,7 @@ mod grammar;
 mod grammar_flow;
 mod live;
 mod monitor;
+pub mod paper_pwz;
 mod prefix_output;
 mod product;
 mod pwz;
