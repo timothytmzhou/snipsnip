@@ -1,8 +1,38 @@
 [package]
-name = "realizability"
+name = "prefixspace"
 version = "0.1.0"
-edition = "2021"
-resolver = "1"
+edition = "2024"
+license = "MIT"
+description = "Delta-maintained streaming PrefixSpace/e-class intersection"
+
+[workspace]
+members = ["web"]
+resolver = "3"
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog", rev = "53b9721b9706741edff2b7c1e379fc37137184d9" }
+cfgrammar = "=0.15.0"
+egglog = { version = "=2.0.0", default-features = false }
+lrlex = "=0.15.0"
+regex = "=1.13.1"
+regex-automata = "=0.4.16"
+regex-syntax = "=0.8.11"
+rustc-hash = "=2.1.3"
+smallvec = "=1.15.2"
+thiserror = "=2.0.19"
+
+[dev-dependencies]
+criterion = "0.7"
+proptest = "1.7"
+
+[[bench]]
+name = "streaming"
+harness = false
+
+[[bench]]
+name = "live"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
