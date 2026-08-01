@@ -22,11 +22,6 @@ thiserror = "=2.0.19"
 
 [dev-dependencies]
 criterion = "0.7"
-proptest = "1.7"
-
-[[bench]]
-name = "streaming"
-harness = false
 
 [[bench]]
 name = "live"

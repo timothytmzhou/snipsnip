@@ -1,7 +1,6 @@
 //! Streaming intersection of syntax-directed CFG prefix spaces with egglog
 //! equivalence classes.
 
-mod automaton;
 mod core;
 mod dataflow;
 mod disjoint;
@@ -10,14 +9,11 @@ mod forest;
 mod grammar;
 mod grammar_flow;
 mod live;
-mod monitor;
 pub mod paper_pwz;
 mod prefix_output;
-mod product;
 mod pwz;
 mod realizability;
 
-pub use automaton::{AutomatonError, RegularTreeGrammar, StateId, TreeTransition};
 pub use grammar::{
     Action, Grammar, GrammarError, LexError, NonterminalId, Production, Symbol, TerminalId, Token,
 };
@@ -28,6 +24,4 @@ pub use live::{
     DEFAULT_PREFIX_SATURATION_ROUND_LIMIT, DEFAULT_UNREALIZABILITY_WORK_LIMIT, LiveMonitorError,
     LiveMonitorStats, LivePrefixMonitor,
 };
-pub use monitor::{MonitorError, MonitorStats, PrefixMonitor};
-pub use product::CompileError;
 pub use pwz::{PwzError, PwzRecognizer, PwzStats};
