@@ -458,14 +458,19 @@ parent or fixed candidate catches up only the retained payloads at its indexed
 memo or context. Residual work from a term-generating context cycle is dropped
 at the focus-work limit; already derived terms remain sound.
 
-The monitor then alternates the installed managed directions, focus
-projection, generated free-constructor rules, and target projection. The free
+When new terms or relevance facts make local closure dirty, the monitor
+alternates the installed managed directions, focus projection, generated
+free-constructor rules, and target projection. The free
 rules require both compared constructor outputs to be in private free-focus
 relations, which mark the target and fixed terms and project relevance into
 free-sort children. Thus unrelated e-graph components do not form a global
 disjointness cross-product. This happens automatically after a lexeme when any
-focused facility is enabled. The ordinary positive-only monitor retains its
-smaller no-egglog push path.
+focused facility is enabled. Zipper-root propagation and universal snapshot
+reconstruction are deferred until the exact positive product is empty. A
+reachable zipper cycle makes the finite universal snapshot incomplete, so
+that pass returns immediately rather than spending the rest of its bound on
+roots which cannot justify a negative answer. The ordinary positive-only
+monitor retains its smaller no-egglog push path.
 
 ## 7. Positive disjointness and the three-way result
 

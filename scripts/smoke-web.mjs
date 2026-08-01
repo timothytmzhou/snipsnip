@@ -7,9 +7,16 @@ const wasm = readFileSync(
 );
 await init({ module_or_path: wasm });
 
-const analyzer = new TypeScriptAnalyzer(
-  TypeScriptAnalyzer.defaultEgglogProgram(),
-);
+const defaultProgram = TypeScriptAnalyzer.defaultEgglogProgram();
+if (
+  !defaultProgram.includes("(datatype Expr") ||
+  !defaultProgram.includes("(rewrite") ||
+  !defaultProgram.includes("(birewrite")
+) {
+  throw new Error("the browser default does not expose its AST and typing rules");
+}
+
+const analyzer = new TypeScriptAnalyzer(defaultProgram);
 
 const invalid = JSON.parse(
   analyzer.analyze("let answer: number = true;"),
@@ -17,8 +24,11 @@ const invalid = JSON.parse(
 if (invalid.realizability !== "unrealizable") {
   throw new Error(`expected an unrealizable TypeScript prefix: ${JSON.stringify(invalid)}`);
 }
-if (invalid.tokens.at(-2)?.realizability !== "unrealizable") {
-  throw new Error("the mismatched `true` token was not marked unrealizable");
+if (invalid.tokens.at(-2)?.realizability !== "unknown") {
+  throw new Error("the open declaration should remain unknown until its semicolon");
+}
+if (invalid.tokens.at(-1)?.realizability !== "unrealizable") {
+  throw new Error("the completed ill-typed declaration was not marked unrealizable");
 }
 
 const valid = JSON.parse(
@@ -31,5 +41,19 @@ if (!valid.tokens.every((token) => token.elapsedMs >= 0)) {
   throw new Error("the token trace did not include timings");
 }
 
+const withoutNumberTyping = defaultProgram.replace(
+  "(birewrite (NumberLiteral) (NumberExpression))",
+  "",
+);
+analyzer.setProgram(withoutNumberTyping);
+const untyped = JSON.parse(
+  analyzer.analyze("let answer: number = 42;"),
+);
+if (untyped.realizability !== "unknown") {
+  throw new Error(
+    `deleting the number-literal typing rule should remove the proof: ${JSON.stringify(untyped)}`,
+  );
+}
+
 analyzer.free();
-console.log("WASM smoke test passed: invalid and valid TypeScript traces agree.");
+console.log("WASM smoke test passed: typing rules control the three-way result.");

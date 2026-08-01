@@ -385,6 +385,7 @@ where
     /// Repeatedly hands constant-depth binding requests to `evaluate` and
     /// records each returned value. Requests created by those values are
     /// drained in the same call.
+    #[cfg(test)]
     pub(crate) fn drain_pending<Error>(
         &mut self,
         mut evaluate: impl FnMut(&PendingBinding) -> Result<Value, Error>,
@@ -401,6 +402,47 @@ where
             };
             self.resolve(binding, value);
             count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
+    /// Like [`Self::drain_pending`], but evaluates every request that is ready
+    /// at the start of a wave in one callback. Resolving that wave may unlock
+    /// another wave of parent constructors.
+    pub(crate) fn drain_pending_batches<Error>(
+        &mut self,
+        mut evaluate: impl FnMut(&[PendingBinding]) -> Result<Vec<Value>, Error>,
+    ) -> Result<usize, Error> {
+        let mut count = 0usize;
+        while !self.pending.is_empty() {
+            let wave_len = self.pending.len();
+            let requests = (0..wave_len)
+                .map(|_| {
+                    let binding = self
+                        .pending
+                        .pop_front()
+                        .expect("the wave length came from this queue");
+                    self.pending_binding(binding)
+                })
+                .collect::<Vec<_>>();
+            let values = match evaluate(&requests) {
+                Ok(values) => values,
+                Err(error) => {
+                    for request in requests.into_iter().rev() {
+                        self.pending.push_front(request.binding);
+                    }
+                    return Err(error);
+                }
+            };
+            assert_eq!(
+                values.len(),
+                requests.len(),
+                "batch evaluator returned the wrong number of values"
+            );
+            for (request, value) in requests.into_iter().zip(values) {
+                self.resolve(request.binding, value);
+                count = count.saturating_add(1);
+            }
         }
         Ok(count)
     }

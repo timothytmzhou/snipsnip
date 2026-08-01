@@ -1,22 +1,6 @@
-const DEFAULT_PROGRAM = `;; A compact free-constructor model of TypeScript types.
-;; The demo grammar maps an annotated initializer to one of these values.
-(datatype Type
-  (Number)
-  (StringType)
-  (Boolean)
-  (Named String)
-  (Function Type Type)
-  (Array Type))
-
-;; Generate constructor disjointness and field propagation rules.
-(free Type TypeDisjoint)
-
-;; Completions of the source prefix must inhabit this e-class.
-(let $required (Number))`;
-
 const VALID_SAMPLE = "let answer: number = 42;";
 const INVALID_SAMPLE = "let answer: number = true;";
-const KEYWORDS = ["let", "number", "true"];
+const KEYWORDS = ["let", "number", "string", "boolean", "true", "false", "length"];
 const INPUT_DEBOUNCE_MS = 300;
 
 const programInput = document.querySelector("#egglog-program");
@@ -33,12 +17,13 @@ const errorPanel = document.querySelector("#error-panel");
 const errorMessage = document.querySelector("#error-message");
 const dismissErrorButton = document.querySelector("#dismiss-error");
 
-programInput.value = DEFAULT_PROGRAM;
+programInput.value = "";
 sourceInput.value = INVALID_SAMPLE;
 
 let worker = null;
 let workerReady = false;
 let engineFailed = false;
+let defaultProgram = "";
 let debounceTimer = null;
 let editVersion = 0;
 let nextRequestId = 1;
@@ -60,7 +45,7 @@ for (const input of [programInput, sourceInput]) {
 }
 
 resetProgramButton.addEventListener("click", () => {
-  programInput.value = DEFAULT_PROGRAM;
+  programInput.value = defaultProgram;
   queueAnalysis({ immediate: true });
   programInput.focus();
 });
@@ -110,6 +95,8 @@ function handleWorkerMessage(event) {
   const message = event.data ?? {};
 
   if (message.type === "ready") {
+    defaultProgram = String(message.defaultProgram ?? "");
+    if (programInput.value === "") programInput.value = defaultProgram;
     workerReady = true;
     engineFailed = false;
     queueAnalysis({ immediate: true });
@@ -332,10 +319,14 @@ function keywordContextMatches(source, start, keyword) {
   //   `l`, ` le`             -> pending `let`
   //   `let x: numb`          -> pending `number`
   //   `let x: number = tr`   -> pending `true`
+  //   `let x: number = "x".le` -> pending `length`
   //   `let t`, `const n`     -> ordinary identifiers, never pending
   if (keyword === "let") return before.length === 0;
-  if (keyword === "number") return before.endsWith(":");
-  if (keyword === "true") return before.endsWith("=");
+  if (["number", "string", "boolean"].includes(keyword)) return before.endsWith(":");
+  if (["true", "false"].includes(keyword)) {
+    return /(?:=|\(|\+|-|\*|\/|%|<)\s*$/u.test(before);
+  }
+  if (keyword === "length") return before.endsWith(".");
   return false;
 }
 
@@ -359,7 +350,7 @@ function findOpenString(source) {
       continue;
     }
 
-    if (character === '"' || character === "'" || character === "`") {
+    if (character === '"' || character === "'") {
       quote = character;
       quoteStart = index;
     }

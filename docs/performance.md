@@ -19,20 +19,19 @@ product architecture.
 
 1. one value-producing PwZ step;
 2. insertion of newly emitted space and zipper facts into the local matcher;
-3. when configured, insertion of new concrete fixed trees, incremental focus
-   propagation through new zipper deltas, and (only for an explicit universal
-   proof) bounded reconstruction of the current concrete roots;
-4. when focused execution is enabled, marking those bindings as relevant followed by
-   automatic managed-rewrite, focus-guarded free-disjointness,
-   focus-projection, and
-   target-projection rounds;
-5. capture and local-worklist closure;
-6. the positive frontier lookup and conservative disjointness proof.
+3. when configured, batched insertion of newly completed concrete fixed trees;
+4. managed-rewrite, free-disjointness, focus-projection, and target-projection
+   rounds only when a new term or relevance fact made that closure dirty;
+5. capture, local-worklist closure, and the cheap positive frontier lookup;
+6. only if that lookup fails, either bounded reconstruction of finite concrete
+   roots for an explicit universal proof, or bounded zipper-focus propagation
+   for a positive-only managed-rewrite query.
 
 The positive-only path does not run an egglog ruleset. The focused path does,
 but neither path serializes classes, rebuilds a CFG product, or replays an
 earlier lexeme. A fixed term is inserted once as a shallow private binding; the
-pending AST spine is not copied. Selected `String`/`i64` spellings cost time
+pending AST spine is not copied, and all bindings ready at one tree depth are
+sent to egglog in one batch. Selected `String`/`i64` spellings cost time
 proportional to their bytes. Unselected terminal spellings are not retained as
 distinct semantic spaces unless an enclosing action makes a concrete result
 independent of that token.

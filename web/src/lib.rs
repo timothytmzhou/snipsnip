@@ -4,37 +4,195 @@ use thiserror::Error;
 use web_time::Instant;
 
 pub const TYPESCRIPT_YACC: &str = r#"
-%start declaration
-%token LET IDENT COLON NUMBER EQ NUM TRUE STRING_LITERAL SEMI
+%start goal
+%token LET IDENT COLON NUMBER_TYPE STRING_TYPE BOOLEAN_TYPE EQ
+%token NUM STRING_LITERAL TRUE FALSE
+%token PLUS MINUS STAR SLASH PERCENT LT DOT
+%token LPAREN RPAREN SEMI
 %%
-declaration: LET IDENT COLON NUMBER EQ expression SEMI { $6 };
-expression: NUM            { Number() }
-          | TRUE           { Boolean() }
-          | STRING_LITERAL { StringType() }
+goal: declaration                                      { Analyze(1) };
+declaration: LET IDENT COLON annotation EQ expression SEMI { LetDeclaration(4, 6) };
+annotation: NUMBER_TYPE                                { NumberAnnotation() }
+          | STRING_TYPE                                { StringAnnotation() }
+          | BOOLEAN_TYPE                               { BooleanAnnotation() }
           ;
+expression: relational                                 { $1 };
+relational: additive                                   { $1 }
+          | relational LT additive                     { LessThan(1, 3) }
+          ;
+additive: multiplicative                               { $1 }
+        | additive PLUS multiplicative                 { Add(1, 3) }
+        | additive MINUS multiplicative                { Subtract(1, 3) }
+        ;
+multiplicative: postfix                                { $1 }
+              | multiplicative STAR postfix            { Multiply(1, 3) }
+              | multiplicative SLASH postfix           { Divide(1, 3) }
+              | multiplicative PERCENT postfix         { Modulo(1, 3) }
+              ;
+postfix: primary                                       { $1 }
+       | postfix DOT IDENT                             { Property(1, 3) }
+       ;
+primary: NUM                                           { NumberLiteral() }
+       | STRING_LITERAL                                { StringLiteral() }
+       | TRUE                                          { TrueLiteral() }
+       | FALSE                                         { FalseLiteral() }
+       | LPAREN expression RPAREN                      { $2 }
+       ;
 "#;
 
 pub const TYPESCRIPT_LEX: &str = r#"
 %%
-let                         'LET'
-number                      'NUMBER'
-true                        'TRUE'
-[0-9]+                      'NUM'
-\"[^\"]*\"                  'STRING_LITERAL'
-[A-Za-z_][A-Za-z0-9_]*      'IDENT'
-:                           'COLON'
-=                           'EQ'
-;                           'SEMI'
-[ \t\r\n]+                  ;
+let                          'LET'
+number                       'NUMBER_TYPE'
+string                       'STRING_TYPE'
+boolean                      'BOOLEAN_TYPE'
+true                         'TRUE'
+false                        'FALSE'
+[0-9]+                       'NUM'
+\"([^\"\\]|\\.)*\"|'([^'\\]|\\.)*' 'STRING_LITERAL'
+[A-Za-z_][A-Za-z0-9_]*       'IDENT'
+:                            'COLON'
+=                            'EQ'
+\+                           'PLUS'
+-                            'MINUS'
+\*                           'STAR'
+/                            'SLASH'
+%                            'PERCENT'
+\<                           'LT'
+\.                           'DOT'
+\(                           'LPAREN'
+\)                           'RPAREN'
+;                            'SEMI'
+[ \t\r\n]+                   ;
 "#;
 
 pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
-(datatype Type
-  (Number)
-  (Boolean)
-  (StringType))
-(free Type TypeDisjoint)
-(let $required (Number))
+(datatype Expr
+  (NumberLiteral)
+  (StringLiteral)
+  (TrueLiteral)
+  (FalseLiteral)
+  (Add Expr Expr)
+  (Subtract Expr Expr)
+  (Multiply Expr Expr)
+  (Divide Expr Expr)
+  (Modulo Expr Expr)
+  (LessThan Expr Expr)
+  (Property Expr String)
+  ;; These four constructors are analysis results, never parser actions.
+  (NumberExpression)
+  (StringExpression)
+  (BooleanExpression)
+  (ExpressionError))
+
+(datatype Annotation
+  (NumberAnnotation)
+  (StringAnnotation)
+  (BooleanAnnotation))
+
+(datatype Declaration
+  (LetDeclaration Annotation Expr))
+
+(datatype Goal
+  (Analyze Declaration)
+  (Accept)
+  (Reject))
+
+;; A negative answer requires an explicit proof. Raw Analyze terms are not
+;; declared disjoint from Accept: without typing rules the answer is Unknown.
+(relation GoalDisjoint (Goal Goal))
+(GoalDisjoint (Reject) (Accept))
+(let $required (Accept))
+
+;; TypeScript typing rules (primitive strict-mode subset).
+;; Literal spelling is deliberately absent from the AST because it cannot
+;; affect any rule in this type-only analysis.
+(birewrite (NumberLiteral) (NumberExpression))
+(birewrite (StringLiteral) (StringExpression))
+(birewrite (TrueLiteral) (BooleanExpression))
+(birewrite (FalseLiteral) (BooleanExpression))
+
+;; Numeric arithmetic.
+(birewrite (Subtract (NumberExpression) (NumberExpression)) (NumberExpression))
+(birewrite (Multiply (NumberExpression) (NumberExpression)) (NumberExpression))
+(birewrite (Divide (NumberExpression) (NumberExpression)) (NumberExpression))
+(birewrite (Modulo (NumberExpression) (NumberExpression)) (NumberExpression))
+
+;; TypeScript + is numeric for two numbers and string concatenation whenever
+;; either operand is a string. Other primitive pairs are errors.
+(birewrite (Add (NumberExpression) (NumberExpression)) (NumberExpression))
+(birewrite (Add (StringExpression) (NumberExpression)) (StringExpression))
+(birewrite (Add (StringExpression) (StringExpression)) (StringExpression))
+(birewrite (Add (StringExpression) (BooleanExpression)) (StringExpression))
+(birewrite (Add (NumberExpression) (StringExpression)) (StringExpression))
+(birewrite (Add (BooleanExpression) (StringExpression)) (StringExpression))
+(rewrite (Add (NumberExpression) (BooleanExpression)) (ExpressionError))
+(rewrite (Add (BooleanExpression) (NumberExpression)) (ExpressionError))
+(rewrite (Add (BooleanExpression) (BooleanExpression)) (ExpressionError))
+
+;; Numeric-only operators reject string and boolean operands.
+(rewrite (Subtract (StringExpression) other) (ExpressionError))
+(rewrite (Subtract other (StringExpression)) (ExpressionError))
+(rewrite (Subtract (BooleanExpression) other) (ExpressionError))
+(rewrite (Subtract other (BooleanExpression)) (ExpressionError))
+(rewrite (Multiply (StringExpression) other) (ExpressionError))
+(rewrite (Multiply other (StringExpression)) (ExpressionError))
+(rewrite (Multiply (BooleanExpression) other) (ExpressionError))
+(rewrite (Multiply other (BooleanExpression)) (ExpressionError))
+(rewrite (Divide (StringExpression) other) (ExpressionError))
+(rewrite (Divide other (StringExpression)) (ExpressionError))
+(rewrite (Divide (BooleanExpression) other) (ExpressionError))
+(rewrite (Divide other (BooleanExpression)) (ExpressionError))
+(rewrite (Modulo (StringExpression) other) (ExpressionError))
+(rewrite (Modulo other (StringExpression)) (ExpressionError))
+(rewrite (Modulo (BooleanExpression) other) (ExpressionError))
+(rewrite (Modulo other (BooleanExpression)) (ExpressionError))
+
+;; Relational results. TypeScript accepts two operands in the same primitive
+;; domain here, including boolean/boolean, and rejects mixed domains.
+(birewrite (LessThan (NumberExpression) (NumberExpression)) (BooleanExpression))
+(birewrite (LessThan (StringExpression) (StringExpression)) (BooleanExpression))
+(birewrite (LessThan (BooleanExpression) (BooleanExpression)) (BooleanExpression))
+(rewrite (LessThan (NumberExpression) (StringExpression)) (ExpressionError))
+(rewrite (LessThan (StringExpression) (NumberExpression)) (ExpressionError))
+(rewrite (LessThan (NumberExpression) (BooleanExpression)) (ExpressionError))
+(rewrite (LessThan (BooleanExpression) (NumberExpression)) (ExpressionError))
+(rewrite (LessThan (StringExpression) (BooleanExpression)) (ExpressionError))
+(rewrite (LessThan (BooleanExpression) (StringExpression)) (ExpressionError))
+
+;; Only strings have `.length` in this subset. `length` remains an ordinary
+;; identifier everywhere else in the grammar.
+(birewrite (Property (StringExpression) "length") (NumberExpression))
+(rewrite (Property (NumberExpression) "length") (ExpressionError))
+(rewrite (Property (BooleanExpression) "length") (ExpressionError))
+(rewrite (Property expression property) (ExpressionError) :when ((!= property "length")))
+
+;; An error is poison through every enclosing expression constructor.
+(rewrite (Add (ExpressionError) other) (ExpressionError))
+(rewrite (Add other (ExpressionError)) (ExpressionError))
+(rewrite (Subtract (ExpressionError) other) (ExpressionError))
+(rewrite (Subtract other (ExpressionError)) (ExpressionError))
+(rewrite (Multiply (ExpressionError) other) (ExpressionError))
+(rewrite (Multiply other (ExpressionError)) (ExpressionError))
+(rewrite (Divide (ExpressionError) other) (ExpressionError))
+(rewrite (Divide other (ExpressionError)) (ExpressionError))
+(rewrite (Modulo (ExpressionError) other) (ExpressionError))
+(rewrite (Modulo other (ExpressionError)) (ExpressionError))
+(rewrite (LessThan (ExpressionError) other) (ExpressionError))
+(rewrite (LessThan other (ExpressionError)) (ExpressionError))
+(rewrite (Property (ExpressionError) property) (ExpressionError))
+
+;; Assignment compatibility for primitive annotations.
+(birewrite (Analyze (LetDeclaration (NumberAnnotation) (NumberExpression))) (Accept))
+(birewrite (Analyze (LetDeclaration (StringAnnotation) (StringExpression))) (Accept))
+(birewrite (Analyze (LetDeclaration (BooleanAnnotation) (BooleanExpression))) (Accept))
+(rewrite (Analyze (LetDeclaration (NumberAnnotation) (StringExpression))) (Reject))
+(rewrite (Analyze (LetDeclaration (NumberAnnotation) (BooleanExpression))) (Reject))
+(rewrite (Analyze (LetDeclaration (StringAnnotation) (NumberExpression))) (Reject))
+(rewrite (Analyze (LetDeclaration (StringAnnotation) (BooleanExpression))) (Reject))
+(rewrite (Analyze (LetDeclaration (BooleanAnnotation) (NumberExpression))) (Reject))
+(rewrite (Analyze (LetDeclaration (BooleanAnnotation) (StringExpression))) (Reject))
+(rewrite (Analyze (LetDeclaration annotation (ExpressionError))) (Reject))
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -107,8 +265,8 @@ pub struct TypeScriptAnalyzer {
 }
 
 impl TypeScriptAnalyzer {
-    /// Creates an analyzer and validates that `program` defines `$required`
-    /// and a `TypeDisjoint` relation suitable for the fixed Type grammar.
+    /// Creates an analyzer and validates that `program` defines `$required`,
+    /// `GoalDisjoint`, and all constructors used by the TypeScript grammar.
     pub fn new(program: impl Into<String>) -> Result<Self, AnalyzerError> {
         let grammar = Grammar::from_yacc_lex(TYPESCRIPT_YACC, TYPESCRIPT_LEX)?;
         let program = program.into();
@@ -216,11 +374,11 @@ impl TypeScriptAnalyzer {
 
 fn new_session(grammar: &Grammar, program: &str) -> Result<Session, AnalyzerError> {
     Ok(Session {
-        monitor: LivePrefixMonitor::from_egglog_with_disjointness(
+        monitor: LivePrefixMonitor::from_egglog_with_local_saturation_and_disjointness(
             grammar,
             program,
             "$required",
-            "TypeDisjoint",
+            "GoalDisjoint",
         )?,
         tokens: Vec::new(),
     })
@@ -342,7 +500,7 @@ mod tests {
                 .iter()
                 .map(|token| token.terminal.as_str())
                 .collect::<Vec<_>>(),
-            ["LET", "IDENT", "COLON", "NUMBER", "EQ", "NUM"]
+            ["LET", "IDENT", "COLON", "NUMBER_TYPE", "EQ", "NUM"]
         );
         assert!(
             report
@@ -356,14 +514,14 @@ mod tests {
         }
         assert!(report.total_ms.is_finite() && report.total_ms >= 0.0);
 
-        for (source, terminal) in [
-            ("let answer: number = true", "TRUE"),
-            ("let answer: number = \"text\"", "STRING_LITERAL"),
+        for source in [
+            "let answer: number = true;",
+            "let answer: number = \"text\";",
         ] {
             let mut invalid = TypeScriptAnalyzer::new(DEFAULT_EGGLOG_PROGRAM).unwrap();
             let report = invalid.analyze(source).unwrap();
             assert_eq!(report.realizability, RealizabilityState::Unrealizable);
-            assert_eq!(report.tokens.last().unwrap().terminal, terminal);
+            assert_eq!(report.tokens.last().unwrap().terminal, "SEMI");
             assert_eq!(
                 report.tokens.last().unwrap().realizability,
                 RealizabilityState::Unrealizable
@@ -396,34 +554,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_negative_knowledge_is_reported_as_unknown() {
-        let mut analyzer = TypeScriptAnalyzer::new(
-            r#"
-            (datatype Type (Number) (Boolean) (StringType))
-            (relation TypeDisjoint (Type Type))
-            (let $required (Number))
-            "#,
-        )
-        .unwrap();
-        let report = analyzer.analyze("let x: number = true").unwrap();
-        assert_eq!(report.realizability, RealizabilityState::Unknown);
-    }
-
-    #[test]
     fn program_replacement_is_validated_and_forces_a_rebuild() {
         let mut analyzer = TypeScriptAnalyzer::new(DEFAULT_EGGLOG_PROGRAM).unwrap();
         analyzer.analyze("let x: number = 1").unwrap();
 
-        let alternate = DEFAULT_EGGLOG_PROGRAM.replace("(Number))", "(Boolean))");
+        let alternate =
+            DEFAULT_EGGLOG_PROGRAM.replace("(let $required (Accept))", "(let $required (Reject))");
         analyzer.set_program(alternate.clone()).unwrap();
         assert_eq!(analyzer.program(), alternate);
-        let report = analyzer.analyze("let x: number = true").unwrap();
+        let report = analyzer.analyze("let x: number = true;").unwrap();
         assert!(!report.incremental);
         assert_eq!(report.realizability, RealizabilityState::Realizable);
 
-        let error = analyzer
-            .set_program("(datatype Type (Number) (Boolean) (StringType))")
-            .unwrap_err();
+        let missing_required = DEFAULT_EGGLOG_PROGRAM.replace("(let $required (Accept))", "");
+        let error = analyzer.set_program(missing_required).unwrap_err();
         assert!(error.to_string().contains("required"), "{error}");
         assert_eq!(
             analyzer.program(),

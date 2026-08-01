@@ -222,23 +222,17 @@ fn merging_a_free_disjoint_pair_triggers_the_invariant() {
     assert!(error.to_string().contains("disjoint"), "{error}");
 }
 
-// This is intentionally a small real-TypeScript rule, not ChopChop's custom
-// typechecker: under `tsc --strict`, a value assigned to an annotated binding
-// must be assignable to the annotation. These cases were checked against
-// TypeScript 5.9.3. The semicolon is syntactically pending when the bad literal
-// already makes every completion invalid.
 #[test]
-fn strict_typescript_annotated_initializer_becomes_unrealizable_early() {
+fn typing_rewrites_analyze_ast_nodes_instead_of_being_baked_into_the_grammar() {
     let grammar = Grammar::from_yacc_lex(
         r#"
-        %start declaration
-        %token LET IDENT COLON NUMBER EQ NUM TRUE STRING_LITERAL SEMI
+        %start goal
+        %token LET IDENT COLON NUMBER EQ NUM TRUE SEMI
         %%
-        declaration: LET IDENT COLON NUMBER EQ expression SEMI { $6 };
-        expression: NUM            { Number() }
-                  | TRUE           { Boolean() }
-                  | STRING_LITERAL { StringType() }
-                  ;
+        goal: declaration { Analyze(1) };
+        declaration: LET IDENT COLON NUMBER EQ expression SEMI { LetDeclaration(6) };
+        expression: NUM  { NumberLiteral() }
+                  | TRUE { TrueLiteral() };
         "#,
         r#"
         %%
@@ -246,7 +240,6 @@ fn strict_typescript_annotated_initializer_becomes_unrealizable_early() {
         number                      'NUMBER'
         true                        'TRUE'
         [0-9]+                      'NUM'
-        \"[^\"]*\"                  'STRING_LITERAL'
         [A-Za-z_][A-Za-z0-9_]*      'IDENT'
         :                           'COLON'
         =                           'EQ'
@@ -255,13 +248,33 @@ fn strict_typescript_annotated_initializer_becomes_unrealizable_early() {
         "#,
     )
     .unwrap();
-    let program = format!("{FREE_TYPES}\n(let $required (Number))");
+    let declarations = r#"
+        (datatype Expr
+          (NumberLiteral)
+          (TrueLiteral)
+          (NumberExpression)
+          (BooleanExpression))
+        (datatype Declaration (LetDeclaration Expr))
+        (datatype Goal (Analyze Declaration) (Accept) (Reject))
+        (relation GoalDisjoint (Goal Goal))
+        (GoalDisjoint (Reject) (Accept))
+        (let $required (Accept))
+    "#;
+    let program = format!(
+        r#"
+        {declarations}
+        (birewrite (NumberLiteral) (NumberExpression))
+        (birewrite (TrueLiteral) (BooleanExpression))
+        (birewrite (Analyze (LetDeclaration (NumberExpression))) (Accept))
+        (rewrite (Analyze (LetDeclaration (BooleanExpression))) (Reject))
+        "#
+    );
 
-    let mut valid = LivePrefixMonitor::from_egglog_with_disjointness(
+    let mut valid = LivePrefixMonitor::from_egglog_with_local_saturation_and_disjointness(
         &grammar,
         &program,
         "$required",
-        "TypeDisjoint",
+        "GoalDisjoint",
     )
     .unwrap();
     for (terminal, lexeme) in [
@@ -271,16 +284,17 @@ fn strict_typescript_annotated_initializer_becomes_unrealizable_early() {
         ("NUMBER", "number"),
         ("EQ", "="),
         ("NUM", "1"),
+        ("SEMI", ";"),
     ] {
         valid.push_token_name(terminal, lexeme).unwrap();
         assert_eq!(valid.realizability(), Some(true));
     }
 
-    let mut invalid = LivePrefixMonitor::from_egglog_with_disjointness(
+    let mut invalid = LivePrefixMonitor::from_egglog_with_local_saturation_and_disjointness(
         &grammar,
         &program,
         "$required",
-        "TypeDisjoint",
+        "GoalDisjoint",
     )
     .unwrap();
     for (terminal, lexeme) in [
@@ -289,12 +303,33 @@ fn strict_typescript_annotated_initializer_becomes_unrealizable_early() {
         ("COLON", ":"),
         ("NUMBER", "number"),
         ("EQ", "="),
+        ("TRUE", "true"),
     ] {
         invalid.push_token_name(terminal, lexeme).unwrap();
-        assert_eq!(invalid.realizability(), Some(true));
     }
-    invalid.push_token_name("TRUE", "true").unwrap();
     assert_eq!(invalid.realizability(), Some(false));
+    invalid.push_token_name("SEMI", ";").unwrap();
+    assert_eq!(invalid.realizability(), Some(false));
+
+    let mut without_rules = LivePrefixMonitor::from_egglog_with_disjointness(
+        &grammar,
+        declarations,
+        "$required",
+        "GoalDisjoint",
+    )
+    .unwrap();
+    for (terminal, lexeme) in [
+        ("LET", "let"),
+        ("IDENT", "x"),
+        ("COLON", ":"),
+        ("NUMBER", "number"),
+        ("EQ", "="),
+        ("NUM", "1"),
+        ("SEMI", ";"),
+    ] {
+        without_rules.push_token_name(terminal, lexeme).unwrap();
+    }
+    assert_eq!(without_rules.realizability(), None);
 }
 
 #[test]

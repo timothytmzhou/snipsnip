@@ -66,6 +66,57 @@ fn rewrite_installed_after_a_complete_prefix_uses_the_current_zipper_root() {
 }
 
 #[test]
+fn adding_a_rewrite_preserves_an_existing_explicit_negative_proof() {
+    let grammar = leaf_grammar();
+    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
+        &grammar,
+        r#"
+        (datatype Ast (Good) (Bad) (Other))
+        (relation AstDisjoint (Ast Ast))
+        (AstDisjoint (Bad) (Good))
+        (let $root (Good))
+        "#,
+        "$root",
+        "AstDisjoint",
+    )
+    .unwrap();
+
+    monitor.push_token_name("BAD", "bad").unwrap();
+    assert_eq!(monitor.realizability(), Some(false));
+    monitor
+        .add_managed_rewrites("(rewrite (Other) (Other))")
+        .unwrap();
+    assert_eq!(monitor.realizability(), Some(false));
+}
+
+#[test]
+fn initial_managed_rewrites_are_bounded_and_run_schedules_are_rejected() {
+    let grammar = Grammar::from_yacc(
+        r#"
+        %start start
+        %token GOOD
+        %%
+        start: GOOD { Good() };
+        "#,
+    )
+    .unwrap();
+    let program = r#"
+        (datatype Ast (Good) (F Ast))
+        (let $root (F (Good)))
+        (rewrite (F value) (F (F value)))
+    "#;
+    let monitor =
+        LivePrefixMonitor::from_egglog_with_local_saturation(&grammar, program, "$root").unwrap();
+    assert_eq!(monitor.stats().managed_rewrite_declarations, 1);
+
+    let with_run = format!("{program}\n(run 1)");
+    assert!(matches!(
+        LivePrefixMonitor::from_egglog_with_local_saturation(&grammar, &with_run, "$root"),
+        Err(LiveMonitorError::UnsupportedUpdateCommand(command)) if command == "run-schedule"
+    ));
+}
+
+#[test]
 fn managed_directed_rewrites_close_a_chain_in_either_declaration_order() {
     let grammar = leaf_grammar();
     for rewrites in [

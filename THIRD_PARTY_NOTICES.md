@@ -4,9 +4,10 @@
 
 Portions of `tests/chopchop_egraph_port.rs`,
 `tests/chopchop_live_updates.rs`, `tests/chopchop_remaining_port.rs`, and
-`tests/live_egraph.rs` are adapted from ChopChop's
+`tests/live_egraph.rs`, plus representative cases in
+`web/tests/typescript_typing.rs`, are adapted from ChopChop's
 `tests/test_egraph.py`, `experiments/egraph/let.egglog`, and
-`experiments/egraph/benchmarks/*.egglog`:
+`experiments/egraph/benchmarks/*.egglog`, and `tests/test_typescript.py`:
 
 - Project: ChopChop
 - Source: https://github.com/large-loris-models/chopchop

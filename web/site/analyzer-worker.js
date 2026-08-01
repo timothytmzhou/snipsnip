@@ -5,7 +5,7 @@
  *   { type: "analyze", id, program, source }
  *
  * Worker -> main thread:
- *   { type: "ready" }
+ *   { type: "ready", defaultProgram }
  *   { type: "result", id, result }
  *   { type: "error", id, error: { message, stack? } }
  *   { type: "engine-error", error: { message, stack? } }
@@ -71,7 +71,10 @@ async function initialize() {
     }
 
     AnalyzerClass = bindings.TypeScriptAnalyzer;
-    self.postMessage({ type: "ready" });
+    self.postMessage({
+      type: "ready",
+      defaultProgram: AnalyzerClass.defaultEgglogProgram(),
+    });
   } catch (error) {
     self.postMessage({ type: "engine-error", error: serializeError(error) });
     throw error;

@@ -445,7 +445,14 @@ impl PrefixOutputBuilder {
             limit: work_budget,
             used: 0,
         };
-        let mut complete = !self.reachable_cycle(frontier, &mut budget);
+        if self.reachable_cycle(frontier, &mut budget) {
+            return PrefixOutput {
+                roots: Vec::new(),
+                complete: false,
+                work: budget.used,
+            };
+        }
+        let mut complete = true;
         let mut agenda = VecDeque::new();
         let mut seen = HashSet::default();
         let mut roots = HashSet::default();

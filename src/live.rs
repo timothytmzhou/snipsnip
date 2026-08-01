@@ -381,7 +381,8 @@ pub struct LivePrefixMonitor {
     fixed_trees: FixedTreeMaterializer<Value>,
     materialized_buffer: Vec<MaterializedCandidate<Value>>,
     constructor_names: Vec<String>,
-    relevance_marked_bindings: HashSet<(SortId, BindingId)>,
+    sort_metadata: Vec<(String, ArcSort)>,
+    relevance_marked_values: HashSet<(SortId, Value)>,
     disjoint_pairs: HashSet<(Value, Value)>,
     complete_free_constructor_ids: HashSet<ConstructorId>,
     complete_disjoint_candidate: bool,
@@ -416,7 +417,13 @@ impl LivePrefixMonitor {
         target_binding: &str,
         disjoint_relation: &str,
     ) -> Result<Self, LiveMonitorError> {
-        Self::from_egglog_internal(grammar, program, target_binding, Some(disjoint_relation))
+        Self::from_egglog_internal(
+            grammar,
+            program,
+            target_binding,
+            Some(disjoint_relation),
+            false,
+        )
     }
 
     pub fn from_egglog(
@@ -424,7 +431,41 @@ impl LivePrefixMonitor {
         program: &str,
         target_binding: &str,
     ) -> Result<Self, LiveMonitorError> {
-        Self::from_egglog_internal(grammar, program, target_binding, None)
+        Self::from_egglog_internal(grammar, program, target_binding, None, false)
+    }
+
+    /// Builds a monitor and automatically runs every rewrite and birewrite in
+    /// `program` only around the distinguished target and concrete syntax
+    /// exposed by the current prefix. Automatic closure is bounded by
+    /// [`DEFAULT_PREFIX_SATURATION_ROUND_LIMIT`]; an unfinished closure remains
+    /// sound and yields `None` unless a proof has already been found.
+    ///
+    /// Explicit run schedules are rejected by this constructor because the
+    /// extracted rewrites belong to the private local scheduler, not Egglog's
+    /// global ruleset.
+    pub fn from_egglog_with_local_saturation(
+        grammar: &Grammar,
+        program: &str,
+        target_binding: &str,
+    ) -> Result<Self, LiveMonitorError> {
+        Self::from_egglog_internal(grammar, program, target_binding, None, true)
+    }
+
+    /// [`Self::from_egglog_with_local_saturation`] plus a positive
+    /// disjointness relation used to prove negative answers.
+    pub fn from_egglog_with_local_saturation_and_disjointness(
+        grammar: &Grammar,
+        program: &str,
+        target_binding: &str,
+        disjoint_relation: &str,
+    ) -> Result<Self, LiveMonitorError> {
+        Self::from_egglog_internal(
+            grammar,
+            program,
+            target_binding,
+            Some(disjoint_relation),
+            true,
+        )
     }
 
     fn from_egglog_internal(
@@ -432,6 +473,7 @@ impl LivePrefixMonitor {
         program: &str,
         target_binding: &str,
         disjoint_relation: Option<&str>,
+        locally_saturate_initial_rewrites: bool,
     ) -> Result<Self, LiveMonitorError> {
         let mut egraph = EGraph::default();
         let prefix = choose_prefix(&egraph, program);
@@ -444,7 +486,25 @@ impl LivePrefixMonitor {
         // otherwise-innocent `(run)`, after local delta facts already exist.
         // Validate definitions as well as each subsequent update.
         reject_nonmonotone_commands(&initial_commands)?;
-        let expansion = expand_free_commands(initial_commands, &free_ruleset)
+        let (initial_rewrites, setup_commands) = if locally_saturate_initial_rewrites {
+            let mut rewrites = Vec::new();
+            let mut setup = Vec::new();
+            for command in initial_commands {
+                match command {
+                    Command::Rewrite(..) | Command::BiRewrite(..) => rewrites.push(command),
+                    Command::RunSchedule(..) => {
+                        return Err(LiveMonitorError::UnsupportedUpdateCommand(
+                            "run-schedule".to_owned(),
+                        ));
+                    }
+                    _ => setup.push(command),
+                }
+            }
+            (rewrites, setup)
+        } else {
+            (Vec::new(), initial_commands)
+        };
+        let expansion = expand_free_commands(setup_commands, &free_ruleset)
             .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
         let declared_constructors = collect_declared_constructors(&expansion.commands);
         let declared_functions = collect_declared_functions(&expansion.commands);
@@ -546,6 +606,18 @@ impl LivePrefixMonitor {
         for constructor in names.constructors.values() {
             constructor_names[constructor.id] = constructor.name.clone();
         }
+        let mut sort_metadata = vec![None; names.sorts.len()];
+        for sort in names.sorts.values() {
+            let egglog_sort = egraph
+                .get_sort_by_name(&sort.name)
+                .expect("monitored sort still exists")
+                .clone();
+            sort_metadata[sort.id] = Some((sort.name.clone(), egglog_sort));
+        }
+        let sort_metadata = sort_metadata
+            .into_iter()
+            .map(|sort| sort.expect("sort IDs are dense"))
+            .collect();
         let complete_free_names = free_sorts
             .iter()
             .filter(|spec| spec.complete)
@@ -582,7 +654,8 @@ impl LivePrefixMonitor {
             fixed_trees,
             materialized_buffer: Vec::new(),
             constructor_names,
-            relevance_marked_bindings: HashSet::new(),
+            sort_metadata,
+            relevance_marked_values: HashSet::new(),
             disjoint_pairs: HashSet::new(),
             complete_free_constructor_ids,
             complete_disjoint_candidate: complete_free_spec && grammar_is_in_complete_free_family,
@@ -609,21 +682,23 @@ impl LivePrefixMonitor {
         };
         monitor.realizability.begin_update();
         monitor.flush_prefix_delta()?;
-        // Before user rewrites are installed these rules only project a
-        // finite e-graph, so this closure cannot generate an unbounded term
-        // sequence.
-        let saturated = monitor.saturate_matcher(usize::MAX)?;
-        monitor.local_saturation_complete = saturated;
-        debug_assert!(saturated);
+        // Without managed user rewrites, these rules only project a finite
+        // e-graph, so this closure cannot generate an unbounded term sequence.
+        let base = monitor.saturate_matcher(usize::MAX)?;
+        debug_assert!(base.complete);
+        monitor.record_saturation(base);
+        if !initial_rewrites.is_empty() {
+            monitor.install_managed_commands(initial_rewrites)?;
+            let managed = monitor.saturate_matcher(DEFAULT_PREFIX_SATURATION_ROUND_LIMIT)?;
+            monitor.local_saturation_complete = managed.complete;
+            monitor.record_saturation(managed);
+        } else {
+            monitor.local_saturation_complete = true;
+        }
         monitor.consume_captures();
         monitor.add_canonical_target();
         let local_matches = monitor.realizability.finish_update();
-        monitor.last_delta_rule_matches = monitor
-            .last_delta_rule_matches
-            .saturating_add(local_matches);
-        monitor.total_delta_rule_matches = monitor
-            .total_delta_rule_matches
-            .saturating_add(local_matches);
+        monitor.record_realizability_matches(local_matches);
         monitor.refresh_answer();
         Ok(monitor)
     }
@@ -673,6 +748,8 @@ impl LivePrefixMonitor {
             return Err(LiveMonitorError::InvalidTerminalId(terminal.index()));
         }
         self.last_basin_rule_matches = 0;
+        self.last_delta_rule_matches = 0;
+        self.last_prefix_output_work = 0;
         self.last_prefix_focus_work = 0;
         self.realizability.begin_update();
         let parser_live = self.parser.push(terminal, lexeme)?;
@@ -694,16 +771,10 @@ impl LivePrefixMonitor {
             self.space_fact_buffer.clear();
             self.zipper_fact_buffer.clear();
             self.current_terminal = None;
-            self.last_delta_rule_matches = self.realizability.finish_update();
-            self.total_delta_rule_matches = self
-                .total_delta_rule_matches
-                .saturating_add(self.last_delta_rule_matches);
+            let matches = self.realizability.finish_update();
+            self.record_realizability_matches(matches);
             self.empty = true;
-            self.current_output_roots.clear();
-            self.current_outputs_complete = false;
-            self.explicit_disjoint_prefix = false;
-            self.last_prefix_output_work = 0;
-            self.last_prefix_focus_work = 0;
+            self.reset_current_prefix_proof();
             self.refresh_realizability_status();
             return Ok(true);
         }
@@ -720,19 +791,28 @@ impl LivePrefixMonitor {
             }
         }
         self.flush_prefix_delta()?;
-        self.prepare_prefix_outputs()?;
-        if self.focused_egraph_enabled() {
-            self.local_saturation_complete =
-                self.saturate_matcher(DEFAULT_PREFIX_SATURATION_ROUND_LIMIT)?;
-            self.consume_captures();
-            self.add_canonical_target();
-        } else {
-            self.local_saturation_complete = true;
+        self.reset_current_prefix_proof();
+        let mut saturation_rounds = DEFAULT_PREFIX_SATURATION_ROUND_LIMIT;
+        self.finish_prefix_phase(&mut saturation_rounds)?;
+        if self.empty
+            && self.disjoint_relation.is_some()
+            && !self.complete_disjoint_target
+            && self.parser.is_live()
+        {
+            // A finite concrete root snapshot serves both as local rewrite
+            // focus and as the explicit universal negative proof. Reachable
+            // zipper cycles fail this phase immediately and leave Unknown.
+            self.realizability.begin_update();
+            self.enumerate_current_outputs_for_disjointness()?;
+            self.finish_prefix_phase(&mut saturation_rounds)?;
+        } else if self.empty && self.names.saturation_initialized && self.parser.is_live() {
+            // Without an explicit negative checker, reconstruct a bounded
+            // concrete zipper focus only to give managed rewrites a chance to
+            // establish a positive witness.
+            self.realizability.begin_update();
+            self.propagate_current_prefix_focus()?;
+            self.finish_prefix_phase(&mut saturation_rounds)?;
         }
-        let matches = self.realizability.finish_update();
-        self.last_delta_rule_matches = matches;
-        self.total_delta_rule_matches = self.total_delta_rule_matches.saturating_add(matches);
-        self.refresh_answer();
         Ok(self.empty)
     }
 
@@ -773,6 +853,7 @@ impl LivePrefixMonitor {
         }
         reject_nonmonotone_commands(&commands)?;
         self.last_basin_rule_matches = 0;
+        self.last_delta_rule_matches = 0;
         self.realizability.begin_update();
         let update_result = self.egraph.run_program(commands);
         let context_result = self.sync_context_functions(declared_functions);
@@ -866,18 +947,32 @@ impl LivePrefixMonitor {
         self.egraph
             .desugar_program(None, rewrites)
             .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
+
+        self.last_basin_rule_matches = 0;
+        self.last_delta_rule_matches = 0;
+        self.realizability.begin_update();
+        self.install_managed_commands(commands)?;
+        if self.parser.is_live() {
+            // The current semantic root can still live only in the zipper
+            // (for example, a just-completed start production). Reconstruct
+            // every bounded concrete root now so a rewrite installed after
+            // the lexeme sees the same focus as a rewrite installed before it.
+            self.propagate_current_prefix_focus()?;
+        }
+        self.egraph_updates = self.egraph_updates.saturating_add(1);
+        self.finish_egraph_delta_with_round_limit(round_limit)
+    }
+
+    fn install_managed_commands(&mut self, commands: Vec<Command>) -> Result<(), LiveMonitorError> {
         let plan = build_managed_rewrite_plan(
             &mut self.egraph,
             &self.names,
             &self.private_prefix,
             commands,
         )?;
-
-        self.last_basin_rule_matches = 0;
-        self.realizability.begin_update();
-        if let Err(error) = self.egraph.run_program(plan.commands) {
-            return Err(LiveMonitorError::Egglog(error.to_string()));
-        }
+        self.egraph
+            .run_program(plan.commands)
+            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
         self.names.saturation_reach = plan.saturation_reach;
         self.names.saturation_initialized = plan.saturation_initialized;
         self.names.projected_functions = plan.projected_functions;
@@ -885,15 +980,10 @@ impl LivePrefixMonitor {
         self.managed_rewrite_declarations = self
             .managed_rewrite_declarations
             .saturating_add(plan.rewrite_count);
-        if self.parser.is_live() {
-            // The current semantic root can still live only in the zipper
-            // (for example, a just-completed start production). Reconstruct
-            // every bounded concrete root now so a rewrite installed after
-            // the lexeme sees the same focus as a rewrite installed before it.
-            self.prepare_prefix_outputs()?;
+        if plan.rewrite_count != 0 {
+            self.local_saturation_complete = false;
         }
-        self.egraph_updates = self.egraph_updates.saturating_add(1);
-        self.finish_egraph_delta_with_round_limit(round_limit)
+        Ok(())
     }
 
     /// Deprecated name for [`Self::add_managed_rewrites`].
@@ -922,6 +1012,7 @@ impl LivePrefixMonitor {
         round_limit: usize,
     ) -> Result<bool, LiveMonitorError> {
         self.last_basin_rule_matches = 0;
+        self.last_delta_rule_matches = 0;
         self.realizability.begin_update();
         self.egraph_updates = self.egraph_updates.saturating_add(1);
         self.finish_egraph_delta_with_round_limit(round_limit)
@@ -941,19 +1032,20 @@ impl LivePrefixMonitor {
         round_limit: usize,
     ) -> Result<bool, LiveMonitorError> {
         if !self.parser.is_live() {
-            self.last_delta_rule_matches = self.realizability.finish_update();
+            let matches = self.realizability.finish_update();
+            self.record_realizability_matches(matches);
             self.refresh_answer();
             return Ok(self.empty);
         }
-        let saturated = self.saturate_matcher(round_limit)?;
-        self.local_saturation_complete = saturated;
+        let saturation = self.saturate_matcher(round_limit)?;
+        self.local_saturation_complete = saturation.complete;
+        self.record_saturation(saturation);
         self.consume_captures();
         self.add_canonical_target();
         let local_matches = self.realizability.finish_update();
-        self.last_delta_rule_matches = self.last_delta_rule_matches.saturating_add(local_matches);
-        self.total_delta_rule_matches = self.total_delta_rule_matches.saturating_add(local_matches);
+        self.record_realizability_matches(local_matches);
         self.refresh_answer();
-        if saturated {
+        if saturation.complete {
             Ok(self.empty)
         } else {
             Err(LiveMonitorError::ManagedSaturationRoundLimit {
@@ -1116,45 +1208,69 @@ impl LivePrefixMonitor {
         Ok(())
     }
 
-    fn prepare_prefix_outputs(&mut self) -> Result<(), LiveMonitorError> {
+    fn reset_current_prefix_proof(&mut self) {
         self.current_output_roots.clear();
         self.current_outputs_complete = false;
         self.explicit_disjoint_prefix = false;
         self.last_prefix_output_work = 0;
-        let needs_explicit_disjointness =
-            self.disjoint_relation.is_some() && !self.complete_disjoint_target;
-        if needs_explicit_disjointness {
-            let output = self.prefix_outputs.enumerate(
-                self.parser.current_frontier(),
-                &mut self.fixed_trees,
-                DEFAULT_PREFIX_OUTPUT_WORK_BUDGET,
-            );
-            self.current_output_roots = output.roots;
-            self.current_outputs_complete = output.complete;
-            self.last_prefix_output_work = output.work;
-            self.total_prefix_output_work =
-                self.total_prefix_output_work.saturating_add(output.work);
-        }
+        self.last_prefix_focus_work = 0;
+    }
 
-        // Snapshot reconstruction may have created shallow detached terms;
-        // ordinary completed-space terms may also have arrived in this
-        // derivative. Evaluate and announce all of them before propagating
-        // the incremental focus delta.
-        self.materialize_fixed_trees()?;
-        if self.names.saturation_initialized {
-            self.prefix_outputs
-                .mark_frontier_relevant(self.parser.current_frontier());
-            let work = self
-                .prefix_outputs
-                .drain_focus(&mut self.fixed_trees, DEFAULT_PREFIX_FOCUS_WORK_LIMIT);
-            self.last_prefix_focus_work = work;
-            self.total_prefix_focus_work = self.total_prefix_focus_work.saturating_add(work);
-            // Focus propagation constructs only one shallow node at a time.
-            // Insert those nodes now so the managed rules in this same update
-            // can see them.
-            self.materialize_fixed_trees()?;
+    fn finish_prefix_phase(
+        &mut self,
+        remaining_saturation_rounds: &mut usize,
+    ) -> Result<(), LiveMonitorError> {
+        if self.focused_egraph_enabled()
+            && !self.local_saturation_complete
+            && *remaining_saturation_rounds != 0
+        {
+            let saturation = self.saturate_matcher(*remaining_saturation_rounds)?;
+            *remaining_saturation_rounds =
+                remaining_saturation_rounds.saturating_sub(saturation.rounds);
+            self.local_saturation_complete = saturation.complete;
+            self.record_saturation(saturation);
+            self.consume_captures();
+            self.add_canonical_target();
+        } else if !self.focused_egraph_enabled() {
+            self.local_saturation_complete = true;
         }
+        let matches = self.realizability.finish_update();
+        self.record_realizability_matches(matches);
+        self.refresh_answer();
         Ok(())
+    }
+
+    fn propagate_current_prefix_focus(&mut self) -> Result<(), LiveMonitorError> {
+        if !self.names.saturation_initialized {
+            return Ok(());
+        }
+        self.prefix_outputs
+            .mark_frontier_relevant(self.parser.current_frontier());
+        let work = self
+            .prefix_outputs
+            .drain_focus(&mut self.fixed_trees, DEFAULT_PREFIX_FOCUS_WORK_LIMIT);
+        self.last_prefix_focus_work = work;
+        self.total_prefix_focus_work = self.total_prefix_focus_work.saturating_add(work);
+        // Focus propagation constructs only one shallow node at a time.
+        self.materialize_fixed_trees()
+    }
+
+    fn enumerate_current_outputs_for_disjointness(&mut self) -> Result<(), LiveMonitorError> {
+        if self.disjoint_relation.is_none() || self.complete_disjoint_target {
+            return Ok(());
+        }
+        let output = self.prefix_outputs.enumerate(
+            self.parser.current_frontier(),
+            &mut self.fixed_trees,
+            DEFAULT_PREFIX_OUTPUT_WORK_BUDGET,
+        );
+        self.current_output_roots = output.roots;
+        self.current_outputs_complete = output.complete;
+        self.last_prefix_output_work = output.work;
+        self.total_prefix_output_work = self.total_prefix_output_work.saturating_add(output.work);
+        // Bounded snapshot reconstruction may have created shallow detached
+        // terms. They are evaluated only after positive intersection failed.
+        self.materialize_fixed_trees()
     }
 
     fn focused_egraph_enabled(&self) -> bool {
@@ -1163,26 +1279,65 @@ impl LivePrefixMonitor {
             || self.names.saturation_initialized
     }
 
+    fn record_saturation(&mut self, saturation: SaturationRun) {
+        let matches = saturation
+            .projection_matches
+            .saturating_add(saturation.basin_matches);
+        self.last_delta_rule_matches = self.last_delta_rule_matches.saturating_add(matches);
+        self.total_delta_rule_matches = self.total_delta_rule_matches.saturating_add(matches);
+        self.last_basin_rule_matches = self
+            .last_basin_rule_matches
+            .saturating_add(saturation.basin_matches);
+        self.total_basin_rule_matches = self
+            .total_basin_rule_matches
+            .saturating_add(saturation.basin_matches);
+    }
+
+    fn record_realizability_matches(&mut self, matches: usize) {
+        self.last_delta_rule_matches = self.last_delta_rule_matches.saturating_add(matches);
+        self.total_delta_rule_matches = self.total_delta_rule_matches.saturating_add(matches);
+    }
+
     fn materialize_fixed_trees(&mut self) -> Result<(), LiveMonitorError> {
         let prefix = self.private_prefix.clone();
         let constructor_names = &self.constructor_names;
         let egraph = &mut self.egraph;
         let mut bindings_to_mark = Vec::new();
-        self.fixed_trees.drain_pending(|request| {
-            let name = request.egglog_name(&prefix);
-            let expression = fixed_binding_expression(request, constructor_names, &prefix);
-            egraph
-                .run_program(vec![Command::Action(EggAction::Let(
+        let mut inserted_enode = false;
+        self.fixed_trees.drain_pending_batches(|requests| {
+            let mut constructor_sizes = HashMap::new();
+            let mut actions = Vec::with_capacity(requests.len());
+            for request in requests {
+                if let BindingRhs::Constructor { constructor, .. } = &request.rhs {
+                    let constructor = &constructor_names[*constructor];
+                    constructor_sizes
+                        .entry(constructor.clone())
+                        .or_insert_with(|| egraph.get_size(constructor));
+                }
+                actions.push(Command::Action(EggAction::Let(
                     egglog::span!(),
-                    name.clone(),
-                    expression,
-                ))])
+                    request.egglog_name(&prefix),
+                    fixed_binding_expression(request, constructor_names, &prefix),
+                )));
+            }
+            egraph
+                .run_program(actions)
                 .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-            let (_, value) = egraph
-                .eval_expr(&Expr::Var(egglog::span!(), name))
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-            bindings_to_mark.push((request.sort, request.binding));
-            Ok::<Value, LiveMonitorError>(value)
+            inserted_enode |= constructor_sizes
+                .iter()
+                .any(|(constructor, size)| egraph.get_size(constructor) > *size);
+
+            requests
+                .iter()
+                .map(|request| {
+                    bindings_to_mark.push((request.sort, request.binding));
+                    let name = request.egglog_name(&prefix);
+                    egraph
+                        .eval_expr(&Expr::Var(egglog::span!(), name))
+                        .map(|(_, value)| value)
+                        .map_err(|error| LiveMonitorError::Egglog(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()
         })?;
 
         self.fixed_trees
@@ -1195,25 +1350,30 @@ impl LivePrefixMonitor {
         if bindings_to_mark.is_empty() {
             return Ok(());
         }
-        let sort_names = self
-            .names
-            .sorts
-            .values()
-            .map(|sort| (sort.id, sort.name.clone()))
-            .collect::<HashMap<_, _>>();
         let mut relevance_actions = Vec::new();
+        let mut relevance_sizes = HashMap::new();
         for (sort, binding) in bindings_to_mark {
-            if !self.relevance_marked_bindings.insert((sort, binding)) {
-                continue;
-            }
-            let Some(sort_name) = sort_names.get(&sort) else {
+            let Some((sort_name, egglog_sort)) = self.sort_metadata.get(sort) else {
                 continue;
             };
+            let Some(value) = self.fixed_trees.binding_value(binding) else {
+                continue;
+            };
+            let value = self.egraph.get_canonical_value(value, egglog_sort);
+            if !self.relevance_marked_values.insert((sort, value)) {
+                continue;
+            }
             let binding = Expr::Var(egglog::span!(), binding.egglog_name(&self.private_prefix));
             if let Some(reach) = self.names.saturation_reach.get(sort_name) {
+                relevance_sizes
+                    .entry(reach.clone())
+                    .or_insert_with(|| self.egraph.get_size(reach));
                 relevance_actions.push(call_command(reach, vec![binding.clone()]));
             }
             if let Some(reach) = self.names.free_reach.get(sort_name) {
+                relevance_sizes
+                    .entry(reach.clone())
+                    .or_insert_with(|| self.egraph.get_size(reach));
                 relevance_actions.push(call_command(reach, vec![binding]));
             }
         }
@@ -1222,15 +1382,21 @@ impl LivePrefixMonitor {
                 .run_program(relevance_actions)
                 .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
         }
+        let added_relevance = relevance_sizes
+            .iter()
+            .any(|(relation, size)| self.egraph.get_size(relation) > *size);
+        if inserted_enode || added_relevance {
+            self.local_saturation_complete = false;
+        }
         Ok(())
     }
 
-    fn saturate_matcher(&mut self, round_limit: usize) -> Result<bool, LiveMonitorError> {
+    fn saturate_matcher(&mut self, round_limit: usize) -> Result<SaturationRun, LiveMonitorError> {
         let mut projection_matches = 0usize;
         let mut basin_matches = 0usize;
         if !self.names.saturation_initialized {
             let mut rounds = 0usize;
-            let saturated = loop {
+            let complete = loop {
                 if rounds == round_limit {
                     break false;
                 }
@@ -1263,15 +1429,15 @@ impl LivePrefixMonitor {
                     break true;
                 }
             };
-            self.last_basin_rule_matches = 0;
-            self.last_delta_rule_matches = projection_matches;
-            self.total_delta_rule_matches = self
-                .total_delta_rule_matches
-                .saturating_add(projection_matches);
-            return Ok(saturated);
+            return Ok(SaturationRun {
+                complete,
+                rounds,
+                projection_matches,
+                basin_matches: 0,
+            });
         }
         let mut rounds = 0usize;
-        let saturated = loop {
+        let complete = loop {
             if rounds == round_limit {
                 break false;
             }
@@ -1330,12 +1496,12 @@ impl LivePrefixMonitor {
                 break true;
             }
         };
-        let matches = projection_matches.saturating_add(basin_matches);
-        self.last_basin_rule_matches = basin_matches;
-        self.total_basin_rule_matches = self.total_basin_rule_matches.saturating_add(basin_matches);
-        self.last_delta_rule_matches = matches;
-        self.total_delta_rule_matches = self.total_delta_rule_matches.saturating_add(matches);
-        Ok(saturated)
+        Ok(SaturationRun {
+            complete,
+            rounds,
+            projection_matches,
+            basin_matches,
+        })
     }
 
     fn consume_captures(&mut self) {
@@ -1461,6 +1627,14 @@ impl LivePrefixMonitor {
             self.disjoint_pairs.contains(&(value, target))
         });
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SaturationRun {
+    complete: bool,
+    rounds: usize,
+    projection_matches: usize,
+    basin_matches: usize,
 }
 
 struct ManagedRewritePlan {
