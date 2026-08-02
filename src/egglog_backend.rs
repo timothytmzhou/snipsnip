@@ -5,7 +5,10 @@ use std::{
 
 use egglog::{
     ArcSort, EGraph, RawValues, Read, Value, Write,
-    ast::{Action as EggAction, Change, Command, Expr, ResolvedCommand},
+    ast::{
+        Action as EggAction, Change, Command, Expr, GenericActions, GenericExpr, GenericFact,
+        ResolvedCommand, ResolvedVar, Rule as EggRule, RuleEvalMode,
+    },
     scheduler::{Matches, Scheduler, SchedulerId},
     sort::S,
     util::FreshGen,
@@ -45,14 +48,10 @@ impl BackendSchema {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExactToken {
-    pub(crate) sort: SortId,
-    pub(crate) value: ValueId,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct BackendDelta {
     pub(crate) changes: Vec<EGraphChange>,
+    /// More focused rule work may become useful before the local fixpoint.
+    pub(crate) updated: bool,
 }
 
 pub(crate) struct BackendInit {
@@ -113,16 +112,35 @@ struct FocusValue {
 #[derive(Default)]
 struct ScheduleState {
     focus: HashSet<FocusValue>,
-    roots: HashMap<String, MatchRoot>,
-    anchors: HashMap<String, Vec<String>>,
-    active: HashSet<String>,
+    rules: HashMap<String, ScheduledRule>,
+    selected: HashMap<(u32, Option<FocusValue>), u16>,
+    deferred: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct MatchRoot {
     variable: String,
     sort: String,
 }
+
+#[derive(Clone)]
+enum RuleSelector {
+    Lhs(MatchRoot),
+    Rhs(MatchRoot),
+    Global,
+}
+
+#[derive(Clone)]
+struct ScheduledRule {
+    id: u32,
+    selector: RuleSelector,
+    /// Top-level function whose outputs can satisfy this selector. `None`
+    /// means the rule cannot be cheaply ruled out before Egglog queries it.
+    anchor: Option<String>,
+}
+
+const MAX_MATCHES_PER_RULE_AND_CLASS: u16 = 4_096;
+const MATCH_BATCH: usize = 64;
 
 /// Egglog computes the matches. This scheduler only decides which already
 /// computed matches belong to the part of the e-graph exposed by the current
@@ -135,36 +153,61 @@ struct FocusScheduler {
 
 impl Scheduler for FocusScheduler {
     fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
-        let state = self.state.read().unwrap();
-        if let Some(root) = state.roots.get(rule) {
-            if state.active.contains(rule) {
-                matches.choose_all();
-                return true;
-            }
-            for index in 0..matches.match_size() {
-                let value = matches.get_match(index).get_value(&root.variable);
-                if state.focus.contains(&FocusValue {
-                    sort: root.sort.clone(),
-                    value,
-                }) {
-                    matches.choose(index);
+        let mut state = self.state.write().unwrap();
+        let Some(rule) = state.rules.get(rule).cloned() else {
+            return false;
+        };
+
+        let mut selected = 0;
+        let mut deferred = false;
+        for index in 0..matches.match_size() {
+            let matched = matches.get_match(index);
+            let value = |variable: &MatchRoot| FocusValue {
+                sort: variable.sort.clone(),
+                value: matched.get_value(&variable.variable),
+            };
+            let relevant_class = match &rule.selector {
+                RuleSelector::Lhs(lhs) => {
+                    let lhs = value(lhs);
+                    state.focus.contains(&lhs).then_some(Some(lhs))
                 }
+                RuleSelector::Rhs(rhs) => {
+                    let rhs = value(rhs);
+                    state.focus.contains(&rhs).then_some(Some(rhs))
+                }
+                RuleSelector::Global => Some(None),
+            };
+            let Some(relevant_class) = relevant_class else {
+                continue;
+            };
+            let count = state.selected.entry((rule.id, relevant_class)).or_default();
+            if *count == MAX_MATCHES_PER_RULE_AND_CLASS {
+                continue;
             }
-            return true;
+            if selected == MATCH_BATCH {
+                deferred = true;
+                continue;
+            }
+            matches.choose(index);
+            *count += 1;
+            selected += 1;
         }
-        // Egglog's public Scheduler API does not expose the final variables
-        // introduced while compiling an ordinary rule. Global execution is
-        // therefore the sound fallback for non-rewrite rules.
-        matches.choose_all();
+        state.deferred |= deferred;
         true
     }
 }
 
 struct TargetValue {
     expression: Expr,
-    sort: ArcSort,
     sort_id: SortId,
     value: ValueId,
+}
+
+struct ValidatedSchema {
+    sorts: Vec<SortSpec>,
+    constructors: Vec<ValidatedConstructor>,
+    constructor_ids: HashMap<String, ConstructorId>,
+    token_sorts: Vec<Vec<TokenSortSpec>>,
 }
 
 /// The only semantic database is `egraph`. The remaining fields are immutable
@@ -179,10 +222,10 @@ pub(crate) struct EgglogBackend {
     constructor_schemas: Arc<[ConstructorSchema]>,
     token_sorts: Vec<Vec<TokenSortSpec>>,
     target: TargetValue,
+    target_focus: HashSet<FocusValue>,
     schedule: Arc<RwLock<ScheduleState>>,
     scheduler: SchedulerId,
-    rulesets: Vec<String>,
-    rule_roots: HashMap<String, Vec<Option<String>>>,
+    intersection_stale: bool,
     pending: Vec<EGraphChange>,
 }
 
@@ -197,7 +240,11 @@ impl EgglogBackend {
         let commands = egraph.parse_program(None, program).map_err(egglog_error)?;
         reject_nonmonotone_commands(&commands)?;
         let commands = without_schedules(commands);
-        let rules = run_commands(&mut egraph, commands)?;
+        let run = run_commands(&mut egraph, commands, None);
+        if let Some(error) = run.error {
+            return Err(error);
+        }
+        let rules = run.rules;
 
         let target_expression = binding_expression(&mut egraph, target_binding)?;
         let (target_sort, target_value) =
@@ -213,8 +260,12 @@ impl EgglogBackend {
             ));
         }
 
-        let (sorts, constructors, constructor_ids, token_sorts) =
-            build_schema(grammar, &input, &egraph, &target_sort)?;
+        let ValidatedSchema {
+            sorts,
+            constructors,
+            constructor_ids,
+            token_sorts,
+        } = build_schema(grammar, &input, &egraph, &target_sort)?;
         let target_sort_id = sorts
             .iter()
             .position(|sort| sort.name == target_sort.name())
@@ -247,17 +298,17 @@ impl EgglogBackend {
             token_sorts,
             target: TargetValue {
                 expression: target_expression,
-                sort: target_sort,
                 sort_id: target_sort_id,
                 value: ValueId(target_value),
             },
+            target_focus: HashSet::new(),
             schedule,
             scheduler,
-            rulesets: Vec::new(),
-            rule_roots: HashMap::new(),
+            intersection_stale: false,
             pending: Vec::new(),
         };
         backend.install_rules(rules);
+        backend.rebuild_target_focus();
         backend.begin_focus();
         Ok(BackendInit { backend, schema })
     }
@@ -266,7 +317,7 @@ impl EgglogBackend {
         &self,
         terminal: TerminalId,
         lexeme: &str,
-        output: &mut Vec<ExactToken>,
+        output: &mut crate::realizability::TokenValues,
     ) -> Result<(), MonitorError> {
         let Some(sorts) = self.token_sorts.get(terminal.index()) else {
             return Err(MonitorError::InvalidTerminalId(terminal.index()));
@@ -282,9 +333,9 @@ impl EgglogBackend {
                     self.egraph.base_to_value(value)
                 }
             };
-            output.push(ExactToken {
+            output.push(TypedClass {
                 sort: token.sort,
-                value: ValueId(value),
+                class: ValueId(value),
             });
         }
         Ok(())
@@ -419,18 +470,13 @@ impl EgglogBackend {
         })
     }
 
-    /// Starts a synchronization with only the target class in focus.
+    /// Starts a new current-prefix focus. Egglog equalities remain monotone,
+    /// but classes reachable only from dead parser branches are not scheduled
+    /// after the next derivative.
     pub(crate) fn begin_focus(&mut self) {
-        let sort = &self.sorts[self.target.sort_id];
-        let target = FocusValue {
-            sort: sort.name.clone(),
-            value: self.canonical(&sort.sort, self.target.value.raw()),
-        };
         let mut schedule = self.schedule.write().unwrap();
-        schedule.focus.clear();
-        schedule.focus.insert(target);
-        drop(schedule);
-        self.close_focus_downward();
+        schedule.focus.clone_from(&self.target_focus);
+        schedule.deferred = false;
     }
 
     /// Adds parser-derived classes to the current focus and closes them
@@ -440,25 +486,47 @@ impl EgglogBackend {
         values: &[TypedClass<ValueId>],
     ) -> Result<bool, MonitorError> {
         let mut changed = false;
-        {
-            let mut schedule = self.schedule.write().unwrap();
-            for value in values {
-                let sort = &self.sorts[value.sort];
-                changed |= schedule.focus.insert(FocusValue {
-                    sort: sort.name.clone(),
-                    value: self.canonical(&sort.sort, value.class.raw()),
-                });
-            }
+        for value in values {
+            let sort = &self.sorts[value.sort];
+            changed |= self.add_focus(FocusValue {
+                sort: sort.name.clone(),
+                value: self.canonical(&sort.sort, value.class.raw()),
+            });
         }
-        changed |= self.close_focus_downward();
+        if changed {
+            changed |= self.close_focus_downward();
+        }
         Ok(changed)
     }
 
-    /// Runs the current focused worklist to local quiescence. Skipped matches
-    /// remain in Egglog's scheduler and are reconsidered when `saturate_near`
-    /// adds another class.
+    fn add_focus(&mut self, value: FocusValue) -> bool {
+        let mut schedule = self.schedule.write().unwrap();
+        schedule.focus.insert(value)
+    }
+
+    /// Runs one small batch of relevant user-rule matches. The monitor checks
+    /// the current intersection between batches, so a useful equality stops a
+    /// productive rule without waiting for global saturation.
     pub(crate) fn saturate_local(&mut self) -> Result<BackendDelta, MonitorError> {
-        self.run_focused_rules()?;
+        let (updated, deferred) = self.step_focused_rules()?;
+        if updated {
+            self.intersection_stale = true;
+            if self.recanonicalize_focus() {
+                self.mark_all();
+                self.intersection_stale = false;
+            }
+            self.close_focus_downward();
+        }
+        if updated || deferred {
+            let mut delta = self.flush_changes()?;
+            delta.updated = true;
+            return Ok(delta);
+        }
+
+        if self.intersection_stale {
+            self.mark_all();
+            self.intersection_stale = false;
+        }
         self.flush_changes()
     }
 
@@ -470,9 +538,15 @@ impl EgglogBackend {
             .egraph
             .eval_expr(&self.target.expression)
             .map_err(egglog_error)?;
-        self.target.value = ValueId(self.canonical(&self.target.sort, target));
+        let target_sort = &self.sorts[self.target.sort_id].sort;
+        let target = ValueId(self.canonical(target_sort, target));
+        if target != self.target.value {
+            self.target.value = target;
+            self.mark(EGraphChange::Target);
+        }
         Ok(BackendDelta {
             changes: std::mem::take(&mut self.pending),
+            updated: false,
         })
     }
 
@@ -486,144 +560,78 @@ impl EgglogBackend {
             .map_err(egglog_error)?;
         reject_nonmonotone_commands(&commands)?;
         let commands = without_schedules(commands);
-        match run_commands(&mut self.egraph, commands) {
-            Ok(rules) => {
-                self.install_rules(rules);
-                self.recanonicalize_focus();
-                self.mark_all();
-                Ok(MutationResult::Applied)
-            }
-            Err(error) => {
-                // Egglog executes a batch in order, so earlier actions may have
-                // landed. Conservatively notify every monitored projection.
-                self.recanonicalize_focus();
-                self.mark_all();
-                Ok(MutationResult::PartiallyApplied(error))
-            }
+        let focus = self.schedule.read().unwrap().focus.clone();
+        let run = run_commands(&mut self.egraph, commands, Some(&focus));
+        let relevant_union = run.relevant_union;
+        self.install_rules(run.rules);
+        let focus_changed = self.recanonicalize_focus();
+        if focus_changed || relevant_union {
+            self.rebuild_target_focus();
+            self.mark_all();
         }
+        Ok(match run.error {
+            None => MutationResult::Applied,
+            Some(error) => MutationResult::PartiallyApplied(error),
+        })
     }
 
-    fn run_focused_rules(&mut self) -> Result<bool, MonitorError> {
-        if self.rulesets.is_empty() {
-            return Ok(false);
+    fn step_focused_rules(&mut self) -> Result<(bool, bool), MonitorError> {
+        let (focus, rules) = {
+            let schedule = self.schedule.read().unwrap();
+            (
+                schedule.focus.clone(),
+                schedule
+                    .rules
+                    .iter()
+                    .map(|(name, rule)| (name.clone(), rule.anchor.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if rules.is_empty() {
+            return Ok((false, false));
         }
-        let mut any_update = false;
-        loop {
-            self.close_focus_downward();
-            let mut updated = false;
-            for ruleset in self.rulesets.clone() {
-                let ruleset_updated = if self.ruleset_is_fully_focused(&ruleset) {
-                    let mut changed = false;
-                    loop {
-                        let report = self.egraph.step_rules(&ruleset).map_err(egglog_error)?;
-                        if !report.updated {
-                            break;
-                        }
-                        changed = true;
-                    }
-                    changed
-                } else {
-                    self.refresh_active_rules();
-                    let report = self
-                        .egraph
-                        .step_rules_with_scheduler(self.scheduler, &ruleset)
-                        .map_err(egglog_error)?;
-                    report.updated
-                };
-                updated |= ruleset_updated;
+
+        let mut updated = false;
+        let mut deferred = false;
+        for (ruleset, anchor) in rules {
+            if anchor
+                .as_deref()
+                .is_some_and(|anchor| !self.function_output_touches_focus(anchor, &focus))
+            {
+                continue;
             }
-            if !updated {
-                break;
-            }
-            any_update = true;
-            self.mark_all();
-            self.recanonicalize_focus();
+            self.schedule.write().unwrap().deferred = false;
+            let report = self
+                .egraph
+                .step_rules_with_scheduler(self.scheduler, &ruleset)
+                .map_err(egglog_error)?;
+            updated |= report.updated;
+            deferred |= self.schedule.read().unwrap().deferred;
         }
-        Ok(any_update)
+        Ok((updated, deferred))
     }
 
     fn install_rules(&mut self, rules: Vec<ResolvedRulePlan>) {
-        if rules.is_empty() {
-            return;
-        }
         let mut schedule = self.schedule.write().unwrap();
         for rule in rules {
-            self.rule_roots
-                .entry(rule.ruleset.clone())
-                .or_default()
-                .push(rule.lhs_anchor.clone());
-            if let Some(root) = rule.root {
-                schedule.roots.insert(rule.name.clone(), root);
-            }
-            if !rule.anchors.is_empty() {
-                schedule.anchors.insert(rule.name.clone(), rule.anchors);
-            }
-            if !self.rulesets.contains(&rule.ruleset) {
-                self.rulesets.push(rule.ruleset);
-            }
+            let id = u32::try_from(schedule.rules.len()).expect("too many Egglog rules");
+            schedule.rules.insert(
+                rule.name,
+                ScheduledRule {
+                    id,
+                    selector: rule.selector,
+                    anchor: rule.anchor,
+                },
+            );
         }
     }
 
-    fn ruleset_is_fully_focused(&self, ruleset: &str) -> bool {
-        let Some(roots) = self.rule_roots.get(ruleset) else {
-            return false;
-        };
-        !roots.is_empty()
-            && roots.iter().all(|root| {
-                root.as_deref()
-                    .is_some_and(|root| self.anchor_is_fully_focused(root))
-            })
-    }
-
-    fn anchor_is_fully_focused(&self, anchor: &str) -> bool {
-        let Some(function) = self.egraph.get_function(anchor) else {
-            return false;
-        };
-        let sort = function.schema().output.clone();
-        let sort_name = sort.name().to_owned();
-        let focus = &self.schedule.read().unwrap().focus;
-        let mut all = true;
-        if self
-            .egraph
-            .constructor_enodes_while(anchor, |enode| {
-                all = focus.contains(&FocusValue {
-                    sort: sort_name.clone(),
-                    value: self.canonical(&sort, enode.eclass),
-                });
-                all
-            })
-            .is_err()
-        {
-            let _ = self.egraph.function_entries_while(anchor, |entry| {
-                all = focus.contains(&FocusValue {
-                    sort: sort_name.clone(),
-                    value: self.canonical(&sort, entry.output),
-                });
-                all
-            });
-        }
-        all
-    }
-
-    fn refresh_active_rules(&self) {
-        let (anchors, focus) = {
-            let schedule = self.schedule.read().unwrap();
-            (schedule.anchors.clone(), schedule.focus.clone())
-        };
-        let mut active = HashSet::new();
-        for (rule, anchors) in anchors {
-            if anchors
-                .iter()
-                .any(|anchor| self.anchor_touches_focus(anchor, &focus))
-            {
-                active.insert(rule);
-            }
-        }
-        self.schedule.write().unwrap().active = active;
-    }
-
-    fn anchor_touches_focus(&self, anchor: &str, focus: &HashSet<FocusValue>) -> bool {
-        let Some(function) = self.egraph.get_function(anchor) else {
+    fn function_output_touches_focus(
+        &self,
+        function_name: &str,
+        focus: &HashSet<FocusValue>,
+    ) -> bool {
+        let Some(function) = self.egraph.get_function(function_name) else {
             return false;
         };
         let sort = function.schema().output.clone();
@@ -631,7 +639,7 @@ impl EgglogBackend {
         let mut found = false;
         if self
             .egraph
-            .constructor_enodes_while(anchor, |enode| {
+            .constructor_enodes_while(function_name, |enode| {
                 found = focus.contains(&FocusValue {
                     sort: sort_name.clone(),
                     value: self.canonical(&sort, enode.eclass),
@@ -640,7 +648,7 @@ impl EgglogBackend {
             })
             .is_err()
         {
-            let _ = self.egraph.function_entries_while(anchor, |entry| {
+            let _ = self.egraph.function_entries_while(function_name, |entry| {
                 found = focus.contains(&FocusValue {
                     sort: sort_name.clone(),
                     value: self.canonical(&sort, entry.output),
@@ -656,24 +664,39 @@ impl EgglogBackend {
         // memory. Repeated whole-table scans would make an n-deep target cost
         // O(n²) even though its e-node graph has only n edges.
         let mut children = HashMap::<FocusValue, Vec<FocusValue>>::new();
-        for (constructor, schema) in self.constructors.iter().zip(&*self.constructor_schemas) {
-            let output_sort = &self.sorts[schema.output];
-            self.egraph
-                .constructor_enodes(&constructor.name, |enode| {
-                    let output = FocusValue {
-                        sort: output_sort.name.clone(),
-                        value: self.canonical(&output_sort.sort, enode.eclass),
-                    };
-                    let row = children.entry(output).or_default();
-                    for (&child, &sort_id) in enode.children.iter().zip(&schema.inputs) {
-                        let sort = &self.sorts[sort_id];
-                        row.push(FocusValue {
-                            sort: sort.name.clone(),
-                            value: self.canonical(&sort.sort, child),
-                        });
-                    }
-                })
-                .expect("grammar actions were validated as constructors");
+        let constructors = self
+            .egraph
+            .functions_iter()
+            .filter(|(_, function)| {
+                !function.is_hidden()
+                    && !function.is_let_binding()
+                    && function.schema().output.is_eq_sort()
+            })
+            .map(|(name, function)| {
+                (
+                    name.clone(),
+                    function.schema().input.clone(),
+                    function.schema().output.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (constructor, input_sorts, output_sort) in constructors {
+            let _ = self.egraph.constructor_enodes(&constructor, |enode| {
+                if enode.subsumed {
+                    return;
+                }
+                let output = FocusValue {
+                    sort: output_sort.name().to_owned(),
+                    value: self.canonical(&output_sort, enode.eclass),
+                };
+                let row = children.entry(output).or_default();
+                for (&child, sort) in enode.children.iter().zip(&input_sorts) {
+                    row.push(FocusValue {
+                        sort: sort.name().to_owned(),
+                        value: self.canonical(sort, child),
+                    });
+                }
+            });
         }
 
         let mut schedule = self.schedule.write().unwrap();
@@ -693,18 +716,44 @@ impl EgglogBackend {
         changed
     }
 
-    fn recanonicalize_focus(&self) {
+    fn rebuild_target_focus(&mut self) {
+        let sort = &self.sorts[self.target.sort_id];
+        let target = FocusValue {
+            sort: sort.name.clone(),
+            value: self.canonical(&sort.sort, self.target.value.raw()),
+        };
+        self.schedule.write().unwrap().focus = HashSet::from([target]);
+        self.close_focus_downward();
+        self.target_focus = self.schedule.read().unwrap().focus.clone();
+    }
+
+    fn recanonicalize_focus(&mut self) -> bool {
         let old = std::mem::take(&mut self.schedule.write().unwrap().focus);
         let mut new = HashSet::with_capacity(old.len());
-        for value in old {
+        for value in &old {
             if let Some(sort) = self.egraph.get_sort_by_name(&value.sort) {
                 new.insert(FocusValue {
-                    sort: value.sort,
+                    sort: value.sort.clone(),
                     value: self.canonical(sort, value.value),
                 });
             }
         }
+        let changed = old != new;
         self.schedule.write().unwrap().focus = new;
+
+        let old_target = std::mem::take(&mut self.target_focus);
+        self.target_focus = old_target
+            .into_iter()
+            .filter_map(|value| {
+                self.egraph
+                    .get_sort_by_name(&value.sort)
+                    .map(|sort| FocusValue {
+                        sort: value.sort,
+                        value: self.canonical(sort, value.value),
+                    })
+            })
+            .collect();
+        changed
     }
 
     fn canonical(&self, sort: &ArcSort, value: Value) -> Value {
@@ -736,146 +785,334 @@ impl EgglogBackend {
     }
 }
 
+#[derive(Clone)]
 struct ResolvedRulePlan {
     name: String,
-    ruleset: String,
-    lhs_anchor: Option<String>,
-    root: Option<MatchRoot>,
-    anchors: Vec<String>,
+    selector: RuleSelector,
+    anchor: Option<String>,
+}
+
+struct CommandRun {
+    rules: Vec<ResolvedRulePlan>,
+    relevant_union: bool,
+    error: Option<MonitorError>,
 }
 
 fn run_commands(
     egraph: &mut EGraph,
     commands: Vec<Command>,
-) -> Result<Vec<ResolvedRulePlan>, MonitorError> {
+    focus: Option<&HashSet<FocusValue>>,
+) -> CommandRun {
     let mut plans = Vec::new();
+    let mut relevant_union = false;
     for command in commands.into_iter().flat_map(directed_rewrites) {
-        if !command_defines_rule(&command) {
-            egraph.run_program(vec![command]).map_err(egglog_error)?;
-            continue;
+        relevant_union |= focus.is_some_and(|focus| union_touches_focus(egraph, &command, focus));
+        let scheduled = match command {
+            Command::Rewrite(_, rewrite, false) => compile_rewrite(egraph, rewrite),
+            Command::Rule { .. } => vec![(command, SelectorSpec::Global, None)],
+            _ => {
+                if let Err(error) = egraph.run_program(vec![command]).map_err(egglog_error) {
+                    return CommandRun {
+                        rules: plans,
+                        relevant_union,
+                        error: Some(error),
+                    };
+                }
+                continue;
+            }
+        };
+        for (mut command, selector, anchor) in scheduled {
+            let result = (|| -> Result<ResolvedRulePlan, MonitorError> {
+                let name = isolate_rule(egraph, &mut command)?;
+                let selector = resolve_selector(egraph, &command, selector)?;
+                egraph.run_program(vec![command]).map_err(egglog_error)?;
+                Ok(ResolvedRulePlan {
+                    name,
+                    selector,
+                    anchor,
+                })
+            })();
+            match result {
+                Ok(plan) => plans.push(plan),
+                Err(error) => {
+                    return CommandRun {
+                        rules: plans,
+                        relevant_union,
+                        error: Some(error),
+                    };
+                }
+            }
         }
-        // Resolve with Egglog itself, then register exactly that desugaring.
-        // The clone prevents the preview's type/name bookkeeping from being
-        // applied twice to the real e-graph.
+    }
+    CommandRun {
+        rules: plans,
+        relevant_union,
+        error: None,
+    }
+}
+
+#[derive(Clone)]
+enum SelectorSpec {
+    Lhs(String),
+    Rhs(String),
+    Global,
+}
+
+fn compile_rewrite(
+    egraph: &mut EGraph,
+    rewrite: egglog::ast::Rewrite,
+) -> Vec<(Command, SelectorSpec, Option<String>)> {
+    let span = rewrite.span.clone();
+    let mut bound = HashSet::new();
+    expression_variable_names(&rewrite.lhs, &mut bound);
+    for condition in &rewrite.conditions {
+        fact_variable_names(condition, &mut bound);
+    }
+    let mut rhs_variables = HashSet::new();
+    expression_variable_names(&rewrite.rhs, &mut rhs_variables);
+    let mut used = bound.union(&rhs_variables).cloned().collect::<HashSet<_>>();
+    let lhs_name = fresh_rule_variable(egraph, "prefixspace_lhs", &mut used);
+    let lhs = Expr::Var(span.clone(), lhs_name.clone());
+    let mut body = vec![GenericFact::Eq(
+        span.clone(),
+        lhs.clone(),
+        rewrite.lhs.clone(),
+    )];
+    body.extend(rewrite.conditions.clone());
+    let forward = Command::Rule {
+        rule: EggRule {
+            span: span.clone(),
+            head: GenericActions(vec![EggAction::Union(
+                span.clone(),
+                lhs.clone(),
+                rewrite.rhs.clone(),
+            )]),
+            body: body.clone(),
+            name: String::new(),
+            ruleset: String::new(),
+            eval_mode: RuleEvalMode::default(),
+            no_decomp: true,
+            include_subsumed: false,
+        },
+    };
+    let lhs_anchor = expression_head(&rewrite.lhs);
+    let rhs_anchor = expression_head(&rewrite.rhs);
+    let mut output = vec![(forward, SelectorSpec::Lhs(lhs_name.clone()), lhs_anchor)];
+
+    let rhs_name = fresh_rule_variable(egraph, "prefixspace_rhs", &mut used);
+    let rhs = Expr::Var(span.clone(), rhs_name.clone());
+    body.push(GenericFact::Eq(span.clone(), rhs.clone(), rewrite.rhs));
+    output.push((
+        Command::Rule {
+            rule: EggRule {
+                span: span.clone(),
+                head: GenericActions(vec![EggAction::Union(span, lhs, rhs)]),
+                body,
+                name: String::new(),
+                ruleset: String::new(),
+                eval_mode: RuleEvalMode::default(),
+                no_decomp: true,
+                include_subsumed: false,
+            },
+        },
+        SelectorSpec::Rhs(rhs_name),
+        rhs_anchor,
+    ));
+    output
+}
+
+fn expression_head(expression: &Expr) -> Option<String> {
+    match expression {
+        GenericExpr::Call(_, name, _) => Some(name.clone()),
+        GenericExpr::Var(..) | GenericExpr::Lit(..) => None,
+    }
+}
+
+fn fresh_rule_variable(egraph: &mut EGraph, hint: &str, used: &mut HashSet<String>) -> String {
+    loop {
+        let internal = egraph.parser.symbol_gen.fresh(hint);
+        let visible = internal.trim_start_matches('@').to_owned();
+        if used.insert(visible.clone()) {
+            return visible;
+        }
+    }
+}
+
+fn expression_variable_names(expression: &Expr, output: &mut HashSet<String>) {
+    match expression {
+        GenericExpr::Var(_, variable) => {
+            output.insert(variable.clone());
+        }
+        GenericExpr::Call(_, _, arguments) => {
+            for argument in arguments {
+                expression_variable_names(argument, output);
+            }
+        }
+        GenericExpr::Lit(..) => {}
+    }
+}
+
+fn fact_variable_names(fact: &egglog::ast::Fact, output: &mut HashSet<String>) {
+    match fact {
+        GenericFact::Eq(_, left, right) => {
+            expression_variable_names(left, output);
+            expression_variable_names(right, output);
+        }
+        GenericFact::Fact(expression) => expression_variable_names(expression, output),
+    }
+}
+
+fn resolve_selector(
+    egraph: &EGraph,
+    command: &Command,
+    selector: SelectorSpec,
+) -> Result<RuleSelector, MonitorError> {
+    let SelectorSpec::Global = selector else {
         let mut preview = egraph.clone();
+        preview.parser.ensure_no_reserved_symbols = false;
         let resolved = preview
             .resolve_program(None, &command.to_string())
             .map_err(egglog_error)?;
-        plans.extend(resolved_rule_plans(
-            &resolved,
-            &mut preview.parser.symbol_gen,
-        ));
-        // Register the user's command itself. The resolved copy above is only
-        // scheduler metadata; it never replaces user logic.
-        egraph.run_program(vec![command]).map_err(egglog_error)?;
+        let rule = resolved.iter().find_map(|command| match command {
+            ResolvedCommand::Rule { rule } => Some(rule),
+            _ => None,
+        });
+        let Some(rule) = rule else {
+            return Err(MonitorError::Egglog(
+                "internal rewrite did not resolve to a rule".to_owned(),
+            ));
+        };
+        let roots = predict_resolved_roots(rule, &mut preview.parser.symbol_gen);
+        let root = |name: &str| -> Result<MatchRoot, MonitorError> {
+            roots.get(name).cloned().ok_or_else(|| {
+                MonitorError::Egglog(format!("internal variable {name} was not resolved"))
+            })
+        };
+        return match selector {
+            SelectorSpec::Lhs(lhs) => Ok(RuleSelector::Lhs(root(&lhs)?)),
+            SelectorSpec::Rhs(rhs) => Ok(RuleSelector::Rhs(root(&rhs)?)),
+            SelectorSpec::Global => unreachable!(),
+        };
+    };
+    Ok(RuleSelector::Global)
+}
+
+fn predict_resolved_roots(
+    rule: &egglog::ast::GenericRule<egglog::ResolvedCall, ResolvedVar>,
+    symbol_gen: &mut egglog::util::SymbolGen,
+) -> HashMap<String, MatchRoot> {
+    fn expression_root(
+        expression: &GenericExpr<egglog::ResolvedCall, ResolvedVar>,
+        symbol_gen: &mut egglog::util::SymbolGen,
+    ) -> Option<ResolvedVar> {
+        match expression {
+            GenericExpr::Var(_, variable) => Some(variable.clone()),
+            GenericExpr::Lit(..) => None,
+            GenericExpr::Call(_, function, arguments) => {
+                let root = symbol_gen.fresh(function);
+                for argument in arguments {
+                    expression_root(argument, symbol_gen);
+                }
+                Some(root)
+            }
+        }
     }
-    Ok(plans)
+
+    let mut roots = HashMap::new();
+    for fact in &rule.body {
+        match fact {
+            GenericFact::Eq(_, left, right) => {
+                let left_root = expression_root(left, symbol_gen);
+                let right_root = expression_root(right, symbol_gen);
+                if let (GenericExpr::Var(_, marker), Some(root)) = (left, right_root.as_ref()) {
+                    roots.insert(
+                        marker.name.clone(),
+                        MatchRoot {
+                            variable: root.name.clone(),
+                            sort: root.sort.name().to_owned(),
+                        },
+                    );
+                }
+                if let (GenericExpr::Var(_, marker), Some(root)) = (right, left_root.as_ref()) {
+                    roots.insert(
+                        marker.name.clone(),
+                        MatchRoot {
+                            variable: root.name.clone(),
+                            sort: root.sort.name().to_owned(),
+                        },
+                    );
+                }
+            }
+            GenericFact::Fact(expression) => {
+                expression_root(expression, symbol_gen);
+            }
+        }
+    }
+    roots
+}
+
+fn union_touches_focus(
+    egraph: &mut EGraph,
+    command: &Command,
+    focus: &HashSet<FocusValue>,
+) -> bool {
+    let Command::Action(EggAction::Union(_, left, right)) = command else {
+        return false;
+    };
+    let Ok((left_sort, left)) = egraph.eval_expr(left) else {
+        return false;
+    };
+    let Ok((right_sort, right)) = egraph.eval_expr(right) else {
+        return false;
+    };
+    if left_sort.name() != right_sort.name() {
+        return false;
+    }
+    let canonical = |value| {
+        if left_sort.is_eq_sort() {
+            let class = egraph.value_to_class_id(&left_sort, value);
+            egraph.class_id_to_value(&class)
+        } else {
+            value
+        }
+    };
+    let left = canonical(left);
+    let right = canonical(right);
+    left != right
+        && [left, right].into_iter().any(|value| {
+            focus.contains(&FocusValue {
+                sort: left_sort.name().to_owned(),
+                value,
+            })
+        })
+}
+
+fn isolate_rule(egraph: &mut EGraph, command: &mut Command) -> Result<String, MonitorError> {
+    let Command::Rule { rule } = command else {
+        return Err(MonitorError::Egglog(
+            "internal scheduler expected a rule".to_owned(),
+        ));
+    };
+    let name = egraph.parser.symbol_gen.fresh("prefixspace_rule");
+    egraph
+        .run_program(vec![Command::AddRuleset(rule.span.clone(), name.clone())])
+        .map_err(egglog_error)?;
+    rule.ruleset = name.clone();
+    rule.name = name.clone();
+    Ok(name)
 }
 
 fn directed_rewrites(command: Command) -> Vec<Command> {
     let Command::BiRewrite(ruleset, rewrite) = command else {
         return vec![command];
     };
-    let base = if rewrite.name.is_empty() {
-        egglog::ast::desugar::rule_name(&Command::BiRewrite(ruleset.clone(), rewrite.clone()))
-    } else {
-        rewrite.name.clone()
-    };
-    let mut forward = rewrite.clone();
-    forward.name = format!("{base}=>");
-    let reverse = egglog::ast::Rewrite {
-        span: rewrite.span,
-        lhs: rewrite.rhs,
-        rhs: rewrite.lhs,
-        conditions: rewrite.conditions,
-        name: format!("{base}<="),
-    };
+    let mut reverse = rewrite.clone();
+    reverse.lhs = rewrite.rhs.clone();
+    reverse.rhs = rewrite.lhs.clone();
     vec![
-        Command::Rewrite(ruleset.clone(), forward, false),
+        Command::Rewrite(ruleset.clone(), rewrite, false),
         Command::Rewrite(ruleset, reverse, false),
     ]
-}
-
-fn resolved_rule_plans(
-    resolved: &[ResolvedCommand],
-    symbol_gen: &mut egglog::util::SymbolGen,
-) -> Vec<ResolvedRulePlan> {
-    resolved
-        .iter()
-        .cloned()
-        .into_iter()
-        .filter_map(|command| match command {
-            ResolvedCommand::Rule { rule } => {
-                let lhs = rewrite_lhs(&rule.body);
-                let root = lhs.map(|call| {
-                    let variable = symbol_gen.fresh(call);
-                    MatchRoot {
-                        variable: variable.name,
-                        sort: variable.sort.name().to_owned(),
-                    }
-                });
-                let lhs_anchor = lhs.map(|call| call.name().to_owned());
-                let anchors = rewrite_anchors(lhs, &rule.head.0);
-                let plan = ResolvedRulePlan {
-                    name: rule.name,
-                    ruleset: rule.ruleset,
-                    lhs_anchor,
-                    root,
-                    anchors,
-                };
-                Some(plan)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn rewrite_anchors(
-    lhs: Option<&egglog::ResolvedCall>,
-    actions: &[egglog::ast::GenericAction<egglog::ResolvedCall, egglog::ast::ResolvedVar>],
-) -> Vec<String> {
-    let Some(lhs) = lhs else {
-        return Vec::new();
-    };
-    let mut anchors = Vec::new();
-    for action in actions {
-        let egglog::ast::GenericAction::Union(_, _, rhs) = action else {
-            continue;
-        };
-        if let egglog::ast::GenericExpr::Call(_, call, _) = rhs {
-            let name = call.name().to_owned();
-            if name != lhs.name() && !anchors.contains(&name) {
-                anchors.push(name);
-            }
-        }
-    }
-    anchors
-}
-
-fn rewrite_lhs(facts: &[egglog::ast::ResolvedFact]) -> Option<&egglog::ResolvedCall> {
-    facts.iter().find_map(|fact| {
-        let egglog::ast::GenericFact::Eq(_, left, right) = fact else {
-            return None;
-        };
-        match (left, right) {
-            (
-                egglog::ast::GenericExpr::Var(_, variable),
-                egglog::ast::GenericExpr::Call(_, call, _),
-            )
-            | (
-                egglog::ast::GenericExpr::Call(_, call, _),
-                egglog::ast::GenericExpr::Var(_, variable),
-            ) if variable.name.contains("rewrite_var__") => Some(call),
-            _ => None,
-        }
-    })
-}
-
-fn command_defines_rule(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Rule { .. } | Command::Rewrite(..) | Command::BiRewrite(..)
-    )
 }
 
 fn without_schedules(commands: Vec<Command>) -> Vec<Command> {
@@ -919,15 +1156,7 @@ fn build_schema(
     input: &RuntimeInput,
     egraph: &EGraph,
     target_sort: &ArcSort,
-) -> Result<
-    (
-        Vec<SortSpec>,
-        Vec<ValidatedConstructor>,
-        HashMap<String, ConstructorId>,
-        Vec<Vec<TokenSortSpec>>,
-    ),
-    MonitorError,
-> {
+) -> Result<ValidatedSchema, MonitorError> {
     let mut sort_map = BTreeMap::<String, ArcSort>::new();
     sort_map.insert(target_sort.name().to_owned(), target_sort.clone());
     let mut constructor_names = Vec::<String>::new();
@@ -1054,7 +1283,12 @@ fn build_schema(
             token_sorts[terminal].push(TokenSortSpec { sort: id, kind });
         }
     }
-    Ok((sorts, constructors, constructor_ids, token_sorts))
+    Ok(ValidatedSchema {
+        sorts,
+        constructors,
+        constructor_ids,
+        token_sorts,
+    })
 }
 
 fn reject_nonmonotone_commands(commands: &[Command]) -> Result<(), MonitorError> {

@@ -12,8 +12,47 @@ fn grammar_with_action(action: &str) -> Grammar {
     .unwrap()
 }
 
+fn lexeme_dependent_bad_grammar() -> Grammar {
+    Grammar::from_yacc_lex(
+        r#"
+        %start start
+        %token TOKEN
+        %%
+        start: TOKEN { Bad(1) };
+        "#,
+        "%%\nbad 'TOKEN'\n",
+    )
+    .unwrap()
+}
+
+const PAIR_REWRITES: &str = r#"
+    (rewrite (Pair left right) left)
+    (rewrite (Pair left right) right)
+"#;
+
+fn pair_bridge_program(include_pair: bool, include_rewrites: bool) -> String {
+    let pair = if include_pair {
+        "(let $bridge (Pair (Bad) (Good)))"
+    } else {
+        ""
+    };
+    let rewrites = if include_rewrites { PAIR_REWRITES } else { "" };
+    format!(
+        r#"
+        (datatype Ast (Good) (Bad) (Pair Ast Ast))
+        (let $root (Good))
+        {pair}
+        {rewrites}
+        "#
+    )
+}
+
 fn numbered_state_grammar(alternative: bool) -> Grammar {
-    let alternative = alternative.then_some("| NUMBER { Bad() }").unwrap_or("");
+    let alternative = if alternative {
+        "| NUMBER { Bad() }"
+    } else {
+        ""
+    };
     Grammar::from_yacc_lex(
         &format!(
             r#"
@@ -34,7 +73,6 @@ fn state_program(goal: i64, target: &str, extra: &str) -> String {
     format!(
         r#"
         (datatype Ast (State i64) (Bad) (Wrap Ast))
-        (relation Disjoint (Ast Ast))
         {extra}
         (let $root {target})
         (rewrite (State n) (State (+ n 1)) :when ((< n {goal})))
@@ -68,22 +106,20 @@ fn wrap(term: &str, depth: usize) -> String {
 
 #[test]
 fn initial_rewrite_applies_to_a_later_prefix() {
-    let grammar = grammar_with_action("Bad()");
+    let grammar = lexeme_dependent_bad_grammar();
     let mut monitor = Monitor::new(
         &grammar,
         r#"
-        (datatype Ast (Good) (Bad))
+        (datatype Ast (Good) (Bad String))
         (let $root (Good))
-        (rewrite (Bad) (Good))
+        (rewrite (Bad value) (Good))
         "#,
         "$root",
     )
     .unwrap();
 
-    assert_eq!(
-        monitor.push_token_name("TOKEN", "token").unwrap(),
-        Some(true)
-    );
+    assert_eq!(monitor.realizability(), None);
+    assert_eq!(monitor.push_token_name("TOKEN", "bad").unwrap(), Some(true));
 }
 
 #[test]
@@ -121,6 +157,195 @@ fn forward_rewrites_do_not_run_backwards() {
     // Running the first rule backwards would create Middle(), after which the
     // second rule would incorrectly connect this prefix to Good().
     assert_eq!(monitor.push_token_name("TOKEN", "token").unwrap(), None);
+}
+
+#[test]
+fn rhs_relevance_uses_an_existing_predecessor_without_running_backwards() {
+    let grammar = grammar_with_action("Bad()");
+
+    for (include_pair, expected) in [(false, None), (true, Some(true))] {
+        let program = pair_bridge_program(include_pair, true);
+        let mut monitor = Monitor::new(&grammar, &program, "$root").unwrap();
+
+        assert_eq!(
+            monitor.push_token_name("TOKEN", "token").unwrap(),
+            expected,
+            "include_pair={include_pair}"
+        );
+    }
+}
+
+#[test]
+fn a_new_candidate_focus_includes_children_of_its_existing_enodes() {
+    let grammar = grammar_with_action("Candidate()");
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (Candidate) (B0) (B1) (Done) (Wrap Ast))
+        (let $candidate (Candidate))
+        (let $hidden (Wrap (B0)))
+        (union $candidate $hidden)
+        (let $root (Wrap (Done)))
+        (rewrite (B0) (B1))
+        (rewrite (B1) (Done))
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor.push_token_name("TOKEN", "token").unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn late_rhs_relevant_rules_reconsider_existing_terms() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(&grammar, &pair_bridge_program(true, false), "$root").unwrap();
+
+    assert_eq!(monitor.push_token_name("TOKEN", "token").unwrap(), None);
+    assert_eq!(monitor.run_egglog(PAIR_REWRITES).unwrap(), Some(true));
+}
+
+#[test]
+fn a_late_predecessor_is_seen_by_existing_rules() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(&grammar, &pair_bridge_program(false, true), "$root").unwrap();
+
+    assert_eq!(monitor.push_token_name("TOKEN", "token").unwrap(), None);
+    assert_eq!(
+        monitor
+            .run_egglog("(let $bridge (Pair (Bad) (Good)))")
+            .unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn productive_infinite_rewrite_stops_when_the_target_is_reached() {
+    let grammar = numbered_state_grammar(false);
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (State i64))
+        (let $root (State 2))
+        (rewrite (State n) (State (+ n 1)))
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    assert_eq!(monitor.realizability(), Some(true));
+    assert_eq!(monitor.push_token_name("NUMBER", "0").unwrap(), Some(true));
+}
+
+#[test]
+fn an_unrelated_productive_rewrite_is_not_run() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (Good) (Bad) (Noise i64))
+        (let $root (Good))
+        (let $noise (Noise 0))
+        (rewrite (Noise n) (Noise (+ n 1)))
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    assert_eq!(monitor.realizability(), None);
+    assert_eq!(monitor.push_token_name("TOKEN", "token").unwrap(), None);
+}
+
+#[test]
+fn an_ordinary_rule_runs_when_one_of_its_facts_touches_the_focus() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (Good) (Bad))
+        (relation Edge (Ast Ast))
+        (let $root (Good))
+        (Edge (Bad) (Good))
+        (rule ((Edge left right)) ((union left right)))
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor.push_token_name("TOKEN", "token").unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn ordinary_rules_follow_helper_facts_to_the_target() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (Good) (Bad) (Middle1) (Middle2))
+        (relation Edge (Ast Ast))
+        (let $root (Good))
+        (Edge (Bad) (Middle1))
+        (Edge (Middle1) (Middle2))
+        (Edge (Middle2) (Good))
+        (rule ((Edge left right)) ((union left right)))
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor.push_token_name("TOKEN", "token").unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn a_constant_rule_head_is_not_hidden_by_an_unrelated_body_value() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (Good) (Bad) (Trigger))
+        (relation Mark (Ast))
+        (let $root (Good))
+        (Mark (Trigger))
+        (rule ((Mark value)) ((union (Bad) (Good))))
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor.push_token_name("TOKEN", "token").unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn duplicate_user_rule_names_are_scheduled_independently() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (Good) (Bad) (Middle))
+        (let $root (Good))
+        (rule ((= value (Bad))) ((union value (Middle))) :name "same")
+        (rule ((= value (Middle))) ((union value (Good))) :name "same")
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor.push_token_name("TOKEN", "token").unwrap(),
+        Some(true)
+    );
 }
 
 #[test]
@@ -281,20 +506,14 @@ fn a_later_rule_extends_existing_equalities_to_the_current_prefix() {
 }
 
 #[test]
-fn a_deep_witness_prevents_an_ambiguous_prefix_from_being_rejected() {
+fn a_deep_witness_is_found_in_an_ambiguous_prefix() {
     let grammar = numbered_state_grammar(true);
-    let program = state_program(1_200, "(State 1200)", "(Disjoint (Bad) (State 1200))");
+    let program = state_program(1_200, "(State 1200)", "");
     let mut monitor = Monitor::new(&grammar, &program, "$root").unwrap();
 
-    let answer = monitor.push_token_name("NUMBER", "0").unwrap();
-    assert_ne!(
-        answer,
-        Some(false),
-        "an unfinished equality proof is not an impossibility proof"
-    );
     assert_eq!(
-        answer,
+        monitor.push_token_name("NUMBER", "0").unwrap(),
         Some(true),
-        "the deep equal parse must be found despite the disjoint parse"
+        "the deep equal parse must be found despite the other parse"
     );
 }

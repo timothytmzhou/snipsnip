@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use crate::{
-    egglog_backend::{BackendDelta, EgglogBackend, ExactToken, MutationResult},
+    egglog_backend::{BackendDelta, EgglogBackend, MutationResult},
     error::MonitorError,
     grammar::{Grammar, RuntimeInput, TerminalId, Token},
     paper_pwz::{Change, ExpressionId, Pwz, Token as PwzToken},
     pwz_grammar,
-    realizability::{RealizabilityEngine, TokenValues, TypedClass},
+    realizability::{RealizabilityEngine, TokenValues},
 };
 
 /// A PwZ parser, a semantic e-graph, and only the relation linking
@@ -86,16 +86,8 @@ impl Monitor {
         if self.parser.zippers().is_empty() {
             return Ok(Some(false));
         }
-        let mut exact_tokens = Vec::<ExactToken>::new();
-        self.backend
-            .exact_tokens(terminal, lexeme, &mut exact_tokens)?;
-        let payload = exact_tokens
-            .iter()
-            .map(|token| TypedClass {
-                sort: token.sort,
-                class: token.value,
-            })
-            .collect();
+        let mut payload = TokenValues::new();
+        self.backend.exact_tokens(terminal, lexeme, &mut payload)?;
         let changes = self.parser.derive(PwzToken {
             terminal: u32::try_from(terminal.index())
                 .map_err(|_| MonitorError::InvalidTerminalId(terminal.index()))?,
@@ -163,21 +155,36 @@ impl Monitor {
 
     fn synchronize(&mut self, new_fixed: &[ExpressionId]) -> Result<(), MonitorError> {
         self.backend.begin_focus();
-        let mut first = true;
+        self.materialize(new_fixed)?;
+        let delta = self.backend.flush_changes()?;
+        self.apply_delta(delta);
+        if self.realizability() == Some(true) {
+            return Ok(());
+        }
+
         loop {
-            self.materialize(if first { new_fixed } else { &[] })?;
-            first = false;
-            let delta = self.backend.flush_changes()?;
+            let delta = self.backend.saturate_local()?;
+            let updated = delta.updated;
+            let changed_intersection = !delta.changes.is_empty();
             self.apply_delta(delta);
             if self.realizability() == Some(true) {
                 return Ok(());
             }
 
-            let delta = self.backend.saturate_local()?;
-            if delta.changes.is_empty() {
+            if changed_intersection {
+                let focus_changed = self.materialize(&[])?;
+                let delta = self.backend.flush_changes()?;
+                self.apply_delta(delta);
+                if self.realizability() == Some(true) {
+                    return Ok(());
+                }
+                if focus_changed {
+                    continue;
+                }
+            }
+            if !updated {
                 return Ok(());
             }
-            self.apply_delta(delta);
         }
     }
 
