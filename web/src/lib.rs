@@ -1,4 +1,4 @@
-use prefixspace::{Grammar, GrammarError, LiveMonitorError, LivePrefixMonitor, TerminalId, Token};
+use prefixspace::{Grammar, GrammarError, Monitor, MonitorError, TerminalId, Token};
 use serde::Serialize;
 use thiserror::Error;
 use web_time::Instant;
@@ -35,11 +35,13 @@ multiplicative: postfix                                { $1 }
               ;
 postfix: primary                                       { $1 }
        | postfix DOT IDENT                             { Property(1, 3) }
+       | postfix LPAREN expression RPAREN              { Call(1, 3) }
        ;
 primary: NUM                                           { NumberLiteral() }
        | STRING_LITERAL                                { StringLiteral() }
        | TRUE                                          { TrueLiteral() }
        | FALSE                                         { FalseLiteral() }
+       | IDENT                                         { Identifier(1) }
        | LPAREN expression RPAREN                      { $2 }
        ;
 "#;
@@ -116,7 +118,7 @@ pub enum AnalyzerError {
     #[error(transparent)]
     Grammar(#[from] GrammarError),
     #[error(transparent)]
-    Monitor(#[from] LiveMonitorError),
+    Monitor(#[from] MonitorError),
     #[error("could not serialize analysis report: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -127,7 +129,7 @@ struct CachedToken {
 }
 
 struct Session {
-    monitor: LivePrefixMonitor,
+    monitor: Monitor,
     tokens: Vec<CachedToken>,
 }
 
@@ -141,7 +143,7 @@ pub struct TypeScriptAnalyzer {
 
 impl TypeScriptAnalyzer {
     /// Creates an analyzer and validates that `program` defines `$required`,
-    /// `GoalDisjoint`, and all constructors used by the TypeScript grammar.
+    /// `Disjoint`, and all constructors used by the TypeScript grammar.
     pub fn new(program: impl Into<String>) -> Result<Self, AnalyzerError> {
         let grammar = Grammar::from_yacc_lex(TYPESCRIPT_YACC, TYPESCRIPT_LEX)?;
         let program = program.into();
@@ -249,12 +251,7 @@ impl TypeScriptAnalyzer {
 
 fn new_session(grammar: &Grammar, program: &str) -> Result<Session, AnalyzerError> {
     Ok(Session {
-        monitor: LivePrefixMonitor::from_egglog_with_local_saturation_and_disjointness(
-            grammar,
-            program,
-            "$required",
-            "GoalDisjoint",
-        )?,
+        monitor: Monitor::new(grammar, program, "$required")?,
         tokens: Vec::new(),
     })
 }

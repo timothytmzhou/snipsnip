@@ -1,17 +1,19 @@
-//! Incremental intersection of a PwZ graph and an e-graph view.
+//! Incremental intersection of a PwZ graph and Egglog.
 //!
 //! PwZ remains the sole owner of parse expressions and continuations. The
-//! e-graph view remains the sole owner of e-nodes and equality. This module
+//! Egglog adapter remains the sole owner of applications and equality. This module
 //! stores only the two cross-system relations: `Produces` and
 //! `RealizableFor` (whose value-independent case is `Realizable`).
 
-use std::hash::Hash;
+use std::{hash::Hash, sync::Arc};
 
 use rustc_hash::FxHashSet as HashSet;
 use smallvec::SmallVec;
 
-use crate::paper_pwz::{
-    Context, ContextId, Edit, ExpressionId, ExpressionNode, MemoId, Pwz, Symbol, Zipper,
+use crate::{
+    egglog_backend::{EgglogBackend, ValueId},
+    error::MonitorError,
+    paper_pwz::{Change, Context, ContextId, ExpressionId, ExpressionNode, MemoId, Pwz, Symbol},
 };
 
 pub(crate) type SortId = usize;
@@ -23,21 +25,7 @@ pub(crate) struct TypedClass<C> {
     pub(crate) class: C,
 }
 
-pub(crate) trait TokenClasses<C> {
-    fn classes(&self) -> &[TypedClass<C>];
-}
-
-impl<C> TokenClasses<C> for Box<[TypedClass<C>]> {
-    fn classes(&self) -> &[TypedClass<C>] {
-        self
-    }
-}
-
-impl<C> TokenClasses<C> for SmallVec<[TypedClass<C>; 2]> {
-    fn classes(&self) -> &[TypedClass<C>] {
-        self
-    }
-}
+pub(crate) type TokenValues = SmallVec<[TypedClass<ValueId>; 2]>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SemanticAction {
@@ -62,36 +50,13 @@ pub(crate) struct ConstructorSchema {
 pub(crate) struct Schema {
     /// Indexed by `Symbol::Grammar`'s original production index.
     pub(crate) actions: Box<[SemanticAction]>,
-    pub(crate) constructors: Box<[ConstructorSchema]>,
+    pub(crate) constructors: Arc<[ConstructorSchema]>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct Enode<C> {
+pub(crate) struct Application<C> {
     pub(crate) output: C,
     pub(crate) children: Box<[C]>,
-}
-
-/// Read-only access to the current e-graph. Implementations own all e-node
-/// storage and equality state; this engine never copies either.
-pub(crate) trait EGraphView<C> {
-    fn canonical(&self, value: TypedClass<C>) -> TypedClass<C>;
-    fn targets(&self) -> &[TypedClass<C>];
-    fn terminal_classes(&self, terminal: u32) -> &[TypedClass<C>];
-    fn enodes(&self, constructor: ConstructorId) -> &[Enode<C>];
-}
-
-/// The two mutations used for focused equality saturation. Implementations
-/// decide how terms are named and how relevance is represented.
-pub(crate) trait EGraphWriter<C>: EGraphView<C> {
-    type Error;
-
-    fn construct(
-        &mut self,
-        constructor: ConstructorId,
-        children: &[TypedClass<C>],
-    ) -> Result<TypedClass<C>, Self::Error>;
-
-    fn mark_relevant(&mut self, values: &[TypedClass<C>]) -> Result<(), Self::Error>;
 }
 
 /// The smallest notification which can make a previously closed product grow.
@@ -119,7 +84,7 @@ impl Site {
     }
 }
 
-trait DenseKey: Copy + Eq + Hash {
+trait DenseKey: Copy {
     fn dense_index(self) -> u64;
 }
 
@@ -244,10 +209,6 @@ where
         }
         output
     }
-
-    fn len(&self) -> usize {
-        self.edges.len()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -290,21 +251,15 @@ enum Event<C> {
     Realizable(Site),
 }
 
-pub(crate) struct RealizabilityEngine<C> {
+pub(crate) struct RealizabilityEngine {
     schema: Schema,
     indexes: Indexes,
-    closure: Closure<C>,
-    agenda: Vec<Event<C>>,
+    closure: Closure<ValueId>,
+    agenda: Vec<Event<ValueId>>,
 }
 
-impl<C> RealizabilityEngine<C>
-where
-    C: Copy + Eq + Hash,
-{
-    pub(crate) fn new<P>(schema: Schema, pwz: &Pwz<P>, egraph: &impl EGraphView<C>) -> Self
-    where
-        P: TokenClasses<C> + Clone,
-    {
+impl RealizabilityEngine {
+    pub(crate) fn new(schema: Schema, pwz: &Pwz<TokenValues>, egraph: &EgglogBackend) -> Self {
         let mut engine = Self {
             schema,
             indexes: Indexes::default(),
@@ -322,47 +277,41 @@ where
                 engine.index_parent(memo, context);
             }
         }
-        engine.seed_targets(egraph);
+        engine.add_target(egraph);
         engine.close(pwz, egraph);
         engine
     }
 
     /// Applies exactly the graph changes returned by one PwZ derivative.
-    pub(crate) fn update_pwz<P>(
+    pub(crate) fn update_pwz(
         &mut self,
-        pwz: &Pwz<P>,
-        edits: &[Edit],
-        egraph: &impl EGraphView<C>,
-    ) -> usize
-    where
-        P: TokenClasses<C> + Clone,
-    {
-        for &edit in edits {
-            match edit {
-                Edit::NewExpression(expression) => self.index_expression(pwz, egraph, expression),
-                Edit::NewContext(context) => self.index_context(pwz, egraph, context),
-                Edit::MemoParentAppended { memo, context } => self.index_parent(memo, context),
-                Edit::AlternativeChildAppended { alternative, child } => {
+        pwz: &Pwz<TokenValues>,
+        changes: &[Change],
+        egraph: &EgglogBackend,
+    ) {
+        for &change in changes {
+            match change {
+                Change::NewExpression(expression) => self.index_expression(pwz, egraph, expression),
+                Change::NewContext(context) => self.index_context(pwz, egraph, context),
+                Change::MemoParentAppended { memo, context } => self.index_parent(memo, context),
+                Change::AlternativeChildAppended { alternative, child } => {
                     self.index_alternative_child(alternative, child)
                 }
             }
         }
-        self.close(pwz, egraph)
+        self.close(pwz, egraph);
     }
 
     /// Applies e-graph deltas without replaying PwZ history.
-    pub(crate) fn update_egraph<P>(
+    pub(crate) fn update_egraph(
         &mut self,
-        pwz: &Pwz<P>,
+        pwz: &Pwz<TokenValues>,
         changes: &[EGraphChange],
-        egraph: &impl EGraphView<C>,
-    ) -> usize
-    where
-        P: TokenClasses<C> + Clone,
-    {
+        egraph: &EgglogBackend,
+    ) {
         for &change in changes {
             match change {
-                EGraphChange::Target => self.seed_targets(egraph),
+                EGraphChange::Target => self.add_target(egraph),
                 EGraphChange::Terminal(terminal) => {
                     let expressions = self
                         .indexes
@@ -387,18 +336,12 @@ where
                 }
             }
         }
-        self.close(pwz, egraph)
+        self.close(pwz, egraph);
     }
 
     /// Reads only the already-closed relations for the current zippers.
-    pub(crate) fn is_realizable<P>(
-        &self,
-        zippers: &[Zipper<P>],
-        egraph: &impl EGraphView<C>,
-    ) -> bool
-    where
-        P: TokenClasses<C>,
-    {
+    pub(crate) fn is_realizable(&self, pwz: &Pwz<TokenValues>, egraph: &EgglogBackend) -> bool {
+        let zippers = pwz.zippers();
         zippers.iter().any(|zipper| {
             let site = Site::Memo(zipper.memo);
             if self.is_realizable_site(site) {
@@ -410,30 +353,15 @@ where
         })
     }
 
-    pub(crate) fn fact_count(&self) -> usize {
-        self.closure.produces.len()
-            + self.closure.realizable_for.len()
-            + self
-                .closure
-                .realizable
-                .iter()
-                .filter(|value| **value)
-                .count()
-    }
-
     /// Inserts only AST fragments already fixed by the consumed prefix. The
     /// resulting classes are ordinary `Produces` facts, so no second concrete
     /// tree store is needed.
-    pub(crate) fn materialize_fixed<P, G>(
+    pub(crate) fn materialize_fixed(
         &mut self,
-        pwz: &Pwz<P>,
+        pwz: &Pwz<TokenValues>,
         expressions: &[ExpressionId],
-        egraph: &mut G,
-    ) -> Result<usize, G::Error>
-    where
-        P: TokenClasses<C> + Clone,
-        G: EGraphWriter<C>,
-    {
+        egraph: &mut EgglogBackend,
+    ) -> Result<bool, MonitorError> {
         let mut expressions = expressions
             .iter()
             .copied()
@@ -441,92 +369,93 @@ where
             .collect::<Vec<_>>();
         expressions.sort_unstable_by_key(|id| id.0);
 
-        let mut work = 0usize;
         for &expression in &expressions {
             self.materialize_expression(pwz, egraph, expression)?;
-            work = work.saturating_add(self.close(pwz, egraph));
+            self.close(pwz, egraph);
         }
 
         let mut relevant = Vec::new();
         for expression in expressions {
-            relevant.extend(
-                self.closure
-                    .produces
-                    .values(expression)
-                    .into_iter()
-                    .map(|value| egraph.canonical(value)),
-            );
+            relevant.extend(self.closure.produces.values(expression));
         }
-        egraph.mark_relevant(&relevant)?;
-        Ok(work)
+        egraph.saturate_near(&relevant)
     }
 
     /// Materializes the fixed path from each current focus outward until the
     /// first genuinely unfinished grammar child. This is transient zipper
     /// evaluation; PwZ remains the only owner of the contexts.
-    pub(crate) fn materialize_focus<P, G>(
+    pub(crate) fn materialize_focus(
         &mut self,
-        pwz: &Pwz<P>,
-        egraph: &mut G,
-    ) -> Result<usize, G::Error>
-    where
-        P: TokenClasses<C> + Clone,
-        G: EGraphWriter<C>,
-    {
+        pwz: &Pwz<TokenValues>,
+        egraph: &mut EgglogBackend,
+    ) -> Result<bool, MonitorError> {
         let mut agenda = Vec::new();
-        for zipper in &pwz.zippers {
+        for zipper in pwz.zippers() {
             let classes = self.focus_classes(&zipper.focus);
             if classes.is_empty() {
-                agenda.push((zipper.memo, None));
+                agenda.push((zipper.memo, None, SmallVec::<[ContextId; 8]>::new()));
             } else {
                 agenda.extend(
                     classes
                         .into_iter()
-                        .map(|value| (zipper.memo, Some(egraph.canonical(value)))),
+                        .map(|value| (zipper.memo, Some(value), SmallVec::<[ContextId; 8]>::new())),
                 );
             }
         }
 
         let mut seen = HashSet::default();
         let mut relevant = Vec::new();
-        let mut work = 0usize;
-        while let Some((memo, value)) = agenda.pop() {
-            let value = value.map(|value| egraph.canonical(value));
+        while let Some((memo, value, path)) = agenda.pop() {
             if !seen.insert((memo, value)) {
                 continue;
             }
-            work = work.saturating_add(1);
             if let Some(value) = value {
                 relevant.push(value);
             }
             for &context in &pwz.memos[&memo].parents {
+                // A cyclic context denotes arbitrarily many possible
+                // completions. Materialization may follow each concrete
+                // context once, but must not enumerate that infinite family.
+                // The relation closure below handles the cycle symbolically.
+                if path.contains(&context) {
+                    continue;
+                }
+                let mut next_path = path.clone();
+                next_path.push(context);
                 match pwz.contexts[&context].clone() {
                     Context::Top => {}
-                    Context::Alt { memo } => agenda.push((memo, value)),
+                    Context::Alt { memo } => agenda.push((memo, value, next_path)),
                     Context::Seq {
-                        memo, symbol, left, ..
+                        memo,
+                        symbol,
+                        left,
+                        right,
                     } => {
-                        for output in self.materialize_context(egraph, &symbol, &left, value)? {
-                            agenda.push((memo, Some(output)));
+                        for expression in left.iter().chain(&right) {
+                            if pwz.expressions[expression].fixed {
+                                relevant.extend(self.closure.produces.values(*expression));
+                            }
+                        }
+                        for output in
+                            self.materialize_context(egraph, &symbol, &left, &right, value)?
+                        {
+                            agenda.push((memo, Some(output), next_path.clone()));
                         }
                     }
                 }
             }
         }
-        egraph.mark_relevant(&relevant)?;
-        Ok(work)
+        egraph.saturate_near(&relevant)
     }
 
-    fn materialize_context<P, G>(
+    fn materialize_context(
         &self,
-        egraph: &mut G,
-        symbol: &Symbol<P>,
+        egraph: &mut EgglogBackend,
+        symbol: &Symbol<TokenValues>,
         left: &[ExpressionId],
-        hole: Option<TypedClass<C>>,
-    ) -> Result<Vec<TypedClass<C>>, G::Error>
-    where
-        G: EGraphWriter<C>,
-    {
+        right: &[ExpressionId],
+        hole: Option<TypedClass<ValueId>>,
+    ) -> Result<Vec<TypedClass<ValueId>>, MonitorError> {
         let action = match symbol {
             Symbol::Bottom => SemanticAction::Project {
                 position: left.len(),
@@ -536,13 +465,7 @@ where
         };
         match action {
             SemanticAction::Project { position } => {
-                if position < left.len() {
-                    Ok(self.closure.produces.values(left[position]).to_vec())
-                } else if position == left.len() {
-                    Ok(hole.into_iter().collect())
-                } else {
-                    Ok(Vec::new())
-                }
+                Ok(self.context_values(left, right, hole, position))
             }
             SemanticAction::Construct {
                 constructor,
@@ -551,16 +474,9 @@ where
                 let schema = &self.schema.constructors[constructor];
                 let mut choices = Vec::with_capacity(arguments.len());
                 for (argument, position) in arguments.iter().copied().enumerate() {
-                    let values = if position < left.len() {
-                        self.closure.produces.values(left[position]).to_vec()
-                    } else if position == left.len() {
-                        hole.into_iter().collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let values = self.context_values(left, right, hole, position);
                     let mut row = Vec::new();
                     for value in values {
-                        let value = egraph.canonical(value);
                         if value.sort == schema.inputs[argument] && !row.contains(&value) {
                             row.push(value);
                         }
@@ -570,25 +486,80 @@ where
                     }
                     choices.push(row);
                 }
+
+                // If the action depends on syntax to the right of the hole,
+                // use only constructor rows already present in Egglog. Those
+                // rows are concrete completions of the current prefix. When
+                // every selected child is already fixed, construct the one
+                // fixed AST fragment so user rewrites can see it immediately.
+                if arguments.iter().any(|position| *position > left.len()) {
+                    let mut outputs = Vec::new();
+                    let mut applications = Vec::new();
+                    egraph.for_each_application(constructor, |application| {
+                        applications.push(application)
+                    });
+                    for application in applications {
+                        if application.children.len() != choices.len()
+                            || !application
+                                .children
+                                .iter()
+                                .enumerate()
+                                .all(|(argument, class)| {
+                                    choices[argument].iter().any(|candidate| {
+                                        egraph.equivalent(
+                                            *candidate,
+                                            TypedClass {
+                                                sort: schema.inputs[argument],
+                                                class: *class,
+                                            },
+                                        )
+                                    })
+                                })
+                        {
+                            continue;
+                        }
+                        outputs.push(TypedClass {
+                            sort: schema.output,
+                            class: application.output,
+                        });
+                    }
+                    return Ok(outputs);
+                }
+
                 let mut outputs = Vec::new();
                 for children in products(&choices) {
-                    outputs.push(egraph.construct(constructor, &children)?);
+                    outputs.push(egraph.add_application(constructor, &children)?);
                 }
                 Ok(outputs)
             }
         }
     }
 
-    fn materialize_expression<P, G>(
+    fn context_values(
+        &self,
+        left: &[ExpressionId],
+        right: &[ExpressionId],
+        hole: Option<TypedClass<ValueId>>,
+        position: usize,
+    ) -> Vec<TypedClass<ValueId>> {
+        if position < left.len() {
+            self.closure.produces.values(left[position]).to_vec()
+        } else if position == left.len() {
+            hole.into_iter().collect()
+        } else {
+            right
+                .get(position - left.len() - 1)
+                .map(|expression| self.closure.produces.values(*expression).to_vec())
+                .unwrap_or_default()
+        }
+    }
+
+    fn materialize_expression(
         &mut self,
-        pwz: &Pwz<P>,
-        egraph: &mut G,
+        pwz: &Pwz<TokenValues>,
+        egraph: &mut EgglogBackend,
         expression: ExpressionId,
-    ) -> Result<(), G::Error>
-    where
-        P: TokenClasses<C> + Clone,
-        G: EGraphWriter<C>,
-    {
+    ) -> Result<(), MonitorError> {
         let ExpressionNode::Seq {
             symbol: Symbol::Grammar(action),
             children,
@@ -608,7 +579,6 @@ where
         for (argument, &position) in arguments.iter().enumerate() {
             let mut row = Vec::new();
             for value in self.closure.produces.values(children[position]) {
-                let value = egraph.canonical(value);
                 if value.sort == schema.inputs[argument] && !row.contains(&value) {
                     row.push(value);
                 }
@@ -620,19 +590,14 @@ where
         }
 
         for children in products(&choices) {
-            let output = egraph.construct(constructor, &children)?;
+            let output = egraph.add_application(constructor, &children)?;
             self.insert_produces(expression, output);
         }
         Ok(())
     }
 
-    fn close<P>(&mut self, pwz: &Pwz<P>, egraph: &impl EGraphView<C>) -> usize
-    where
-        P: TokenClasses<C> + Clone,
-    {
-        let mut work = 0usize;
+    fn close(&mut self, pwz: &Pwz<TokenValues>, egraph: &EgglogBackend) {
         while let Some(event) = self.agenda.pop() {
-            work = work.saturating_add(1);
             match event {
                 Event::Produces(expression, value) => {
                     for consumer in self.indexes.consumers_by_expression.values(expression.0) {
@@ -640,7 +605,10 @@ where
                             Consumer::Alternative(alternative) => {
                                 self.insert_produces(alternative, value)
                             }
-                            _ => self.recheck_consumer(pwz, egraph, consumer),
+                            Consumer::Sequence(sequence) => self
+                                .propagate_sequence_value(pwz, egraph, sequence, expression, value),
+                            Consumer::Context(context) => self
+                                .propagate_context_value(pwz, egraph, context, expression, value),
                         }
                     }
                 }
@@ -652,7 +620,7 @@ where
                     }
                     Site::Memo(memo) => {
                         for context in self.indexes.contexts_by_outer_memo.values(memo.0) {
-                            self.recheck_context(pwz, egraph, context);
+                            self.propagate_context_demand(pwz, egraph, context, value);
                         }
                     }
                 },
@@ -664,23 +632,20 @@ where
                     }
                     Site::Memo(memo) => {
                         for context in self.indexes.contexts_by_outer_memo.values(memo.0) {
-                            self.recheck_context(pwz, egraph, context);
+                            self.insert_realizable(Site::Context(context));
                         }
                     }
                 },
             }
         }
-        work
     }
 
-    fn index_expression<P>(
+    fn index_expression(
         &mut self,
-        pwz: &Pwz<P>,
-        egraph: &impl EGraphView<C>,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
         expression: ExpressionId,
-    ) where
-        P: TokenClasses<C> + Clone,
-    {
+    ) {
         match pwz.expressions[&expression].node.clone() {
             ExpressionNode::Tok(terminal) => {
                 let terminal = terminal as usize;
@@ -749,16 +714,16 @@ where
         }
     }
 
-    fn index_context<P>(&mut self, pwz: &Pwz<P>, egraph: &impl EGraphView<C>, context: ContextId)
-    where
-        P: TokenClasses<C> + Clone,
-    {
+    fn index_context(
+        &mut self,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
+        context: ContextId,
+    ) {
         match pwz.contexts[&context].clone() {
             Context::Top => {
                 self.indexes.top_contexts.push(context);
-                for target in egraph.targets() {
-                    self.insert_realizable_for(Site::Context(context), egraph.canonical(*target));
-                }
+                self.insert_realizable_for(Site::Context(context), egraph.target());
             }
             Context::Alt { memo } => {
                 self.indexes.contexts_by_outer_memo.push(memo.0, context);
@@ -830,18 +795,18 @@ where
         }
     }
 
-    fn seed_targets(&mut self, egraph: &impl EGraphView<C>) {
+    fn add_target(&mut self, egraph: &EgglogBackend) {
         for context in self.indexes.top_contexts.clone() {
-            for target in egraph.targets() {
-                self.insert_realizable_for(Site::Context(context), egraph.canonical(*target));
-            }
+            self.insert_realizable_for(Site::Context(context), egraph.target());
         }
     }
 
-    fn recheck_consumer<P>(&mut self, pwz: &Pwz<P>, egraph: &impl EGraphView<C>, consumer: Consumer)
-    where
-        P: TokenClasses<C> + Clone,
-    {
+    fn recheck_consumer(
+        &mut self,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
+        consumer: Consumer,
+    ) {
         match consumer {
             Consumer::Alternative(expression) | Consumer::Sequence(expression) => {
                 self.recheck_expression(pwz, egraph, expression)
@@ -850,19 +815,312 @@ where
         }
     }
 
-    fn recheck_expression<P>(
+    /// Joins one newly produced child value with only the rules that consume
+    /// that child. Rechecking the whole expression here would replay every old
+    /// child value after each insertion and turn a linear e-graph delta into a
+    /// cubic closure.
+    fn propagate_sequence_value(
         &mut self,
-        pwz: &Pwz<P>,
-        egraph: &impl EGraphView<C>,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
+        sequence: ExpressionId,
+        child: ExpressionId,
+        value: TypedClass<ValueId>,
+    ) {
+        let ExpressionNode::Seq { symbol, children } = pwz.expressions[&sequence].node.clone()
+        else {
+            return;
+        };
+        match symbol {
+            Symbol::Token(_) => {}
+            Symbol::Bottom => {
+                if children.last() == Some(&child) {
+                    self.insert_produces(sequence, value);
+                }
+            }
+            Symbol::Grammar(action) => match self.schema.actions[action as usize].clone() {
+                SemanticAction::Project { position } => {
+                    if children[position] == child {
+                        self.insert_produces(sequence, value);
+                    }
+                }
+                SemanticAction::Construct {
+                    constructor,
+                    arguments,
+                } => {
+                    let schema = self.schema.constructors[constructor].clone();
+                    let mut applications = Vec::new();
+                    egraph.for_each_application(constructor, |application| {
+                        applications.push(application)
+                    });
+                    for changed_argument in
+                        arguments
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(argument, &position)| {
+                                (children[position] == child
+                                    && value.sort == schema.inputs[argument])
+                                    .then_some(argument)
+                            })
+                    {
+                        for application in &applications {
+                            let changed_child = TypedClass {
+                                sort: schema.inputs[changed_argument],
+                                class: application.children[changed_argument],
+                            };
+                            if !egraph.equivalent(changed_child, value) {
+                                continue;
+                            }
+                            if !arguments.iter().enumerate().all(|(argument, position)| {
+                                argument == changed_argument
+                                    || self.has_produces(
+                                        egraph,
+                                        children[*position],
+                                        TypedClass {
+                                            sort: schema.inputs[argument],
+                                            class: application.children[argument],
+                                        },
+                                    )
+                            }) {
+                                continue;
+                            }
+                            self.insert_produces(
+                                sequence,
+                                TypedClass {
+                                    sort: schema.output,
+                                    class: application.output,
+                                },
+                            );
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    fn propagate_context_value(
+        &mut self,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
+        context: ContextId,
         expression: ExpressionId,
-    ) where
-        P: TokenClasses<C> + Clone,
-    {
+        value: TypedClass<ValueId>,
+    ) {
+        let Context::Seq {
+            memo,
+            symbol,
+            left,
+            right,
+        } = pwz.contexts[&context].clone()
+        else {
+            return;
+        };
+        let demands = self.closure.realizable_for.values(Site::Memo(memo));
+        match symbol {
+            Symbol::Token(_) => {}
+            Symbol::Bottom => {
+                if matches!(context_child(&left, &right, 1), Child::Fixed(id) if id == expression)
+                    && demands
+                        .iter()
+                        .any(|demand| egraph.equivalent(*demand, value))
+                {
+                    self.insert_realizable(Site::Context(context));
+                }
+            }
+            Symbol::Grammar(action) => match self.schema.actions[action as usize].clone() {
+                SemanticAction::Project { position } => {
+                    if matches!(context_child(&left, &right, position), Child::Fixed(id) if id == expression)
+                        && demands
+                            .iter()
+                            .any(|demand| egraph.equivalent(*demand, value))
+                    {
+                        self.insert_realizable(Site::Context(context));
+                    }
+                }
+                SemanticAction::Construct {
+                    constructor,
+                    arguments,
+                } => {
+                    for argument in
+                        arguments
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(argument, position)| {
+                                matches!(
+                                    context_child(&left, &right, *position),
+                                    Child::Fixed(id) if id == expression
+                                )
+                                .then_some(argument)
+                            })
+                    {
+                        for &demand in &demands {
+                            self.propagate_construct_context(
+                                egraph,
+                                context,
+                                constructor,
+                                &arguments,
+                                &left,
+                                &right,
+                                demand,
+                                Some((argument, value)),
+                            );
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    fn propagate_context_demand(
+        &mut self,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
+        context: ContextId,
+        demand: TypedClass<ValueId>,
+    ) {
+        match pwz.contexts[&context].clone() {
+            Context::Top => {}
+            Context::Alt { .. } => {
+                self.insert_realizable_for(Site::Context(context), demand);
+            }
+            Context::Seq {
+                symbol,
+                left,
+                right,
+                ..
+            } => match symbol {
+                Symbol::Token(_) => {}
+                Symbol::Bottom => self.propagate_project_context_demand(
+                    egraph,
+                    context,
+                    context_child(&left, &right, 1),
+                    demand,
+                ),
+                Symbol::Grammar(action) => match self.schema.actions[action as usize].clone() {
+                    SemanticAction::Project { position } => self.propagate_project_context_demand(
+                        egraph,
+                        context,
+                        context_child(&left, &right, position),
+                        demand,
+                    ),
+                    SemanticAction::Construct {
+                        constructor,
+                        arguments,
+                    } => self.propagate_construct_context(
+                        egraph,
+                        context,
+                        constructor,
+                        &arguments,
+                        &left,
+                        &right,
+                        demand,
+                        None,
+                    ),
+                },
+            },
+        }
+    }
+
+    fn propagate_project_context_demand(
+        &mut self,
+        egraph: &EgglogBackend,
+        context: ContextId,
+        child: Child,
+        demand: TypedClass<ValueId>,
+    ) {
+        match child {
+            Child::Hole => self.insert_realizable_for(Site::Context(context), demand),
+            Child::Fixed(expression) => {
+                if self.has_produces(egraph, expression, demand) {
+                    self.insert_realizable(Site::Context(context));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propagate_construct_context(
+        &mut self,
+        egraph: &EgglogBackend,
+        context: ContextId,
+        constructor: ConstructorId,
+        arguments: &[usize],
+        left: &[ExpressionId],
+        right: &[ExpressionId],
+        demand: TypedClass<ValueId>,
+        changed: Option<(usize, TypedClass<ValueId>)>,
+    ) {
+        let schema = self.schema.constructors[constructor].clone();
+        if demand.sort != schema.output {
+            return;
+        }
+        let mut applications = Vec::new();
+        egraph.for_each_application(constructor, |application| applications.push(application));
+        for application in applications {
+            let output = TypedClass {
+                sort: schema.output,
+                class: application.output,
+            };
+            if !egraph.equivalent(output, demand) {
+                continue;
+            }
+            if let Some((argument, value)) = changed {
+                let child = TypedClass {
+                    sort: schema.inputs[argument],
+                    class: application.children[argument],
+                };
+                if !egraph.equivalent(child, value) {
+                    continue;
+                }
+            }
+            let mut hole = None;
+            let fixed_match = arguments.iter().enumerate().all(|(argument, position)| {
+                match context_child(left, right, *position) {
+                    Child::Hole => {
+                        hole = Some(argument);
+                        true
+                    }
+                    Child::Fixed(expression) => {
+                        changed.is_some_and(|(changed_argument, _)| changed_argument == argument)
+                            || self.has_produces(
+                                egraph,
+                                expression,
+                                TypedClass {
+                                    sort: schema.inputs[argument],
+                                    class: application.children[argument],
+                                },
+                            )
+                    }
+                }
+            });
+            if !fixed_match {
+                continue;
+            }
+            if let Some(argument) = hole {
+                self.insert_realizable_for(
+                    Site::Context(context),
+                    TypedClass {
+                        sort: schema.inputs[argument],
+                        class: application.children[argument],
+                    },
+                );
+            } else {
+                self.insert_realizable(Site::Context(context));
+            }
+        }
+    }
+
+    fn recheck_expression(
+        &mut self,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
+        expression: ExpressionId,
+    ) {
         match pwz.expressions[&expression].node.clone() {
             ExpressionNode::Tok(terminal) => {
-                for value in egraph.terminal_classes(terminal) {
-                    self.insert_produces(expression, egraph.canonical(*value));
-                }
+                egraph.for_each_terminal_value(terminal, |value| {
+                    self.insert_produces(expression, value)
+                });
             }
             ExpressionNode::Alt { children } => {
                 for child in children {
@@ -873,8 +1131,8 @@ where
             }
             ExpressionNode::Seq { symbol, children } => match symbol {
                 Symbol::Token(token) => {
-                    for value in token.payload.classes() {
-                        self.insert_produces(expression, egraph.canonical(*value));
+                    for value in &token.payload {
+                        self.insert_produces(expression, *value);
                     }
                 }
                 Symbol::Bottom => {
@@ -895,24 +1153,28 @@ where
                         arguments,
                     } => {
                         let schema = self.schema.constructors[constructor].clone();
-                        for enode in egraph.enodes(constructor) {
-                            assert_eq!(schema.inputs.len(), enode.children.len());
+                        let mut applications = Vec::new();
+                        egraph.for_each_application(constructor, |application| {
+                            applications.push(application)
+                        });
+                        for application in applications {
+                            assert_eq!(schema.inputs.len(), application.children.len());
                             if arguments.iter().enumerate().all(|(argument, position)| {
                                 self.has_produces(
                                     egraph,
                                     children[*position],
                                     TypedClass {
                                         sort: schema.inputs[argument],
-                                        class: enode.children[argument],
+                                        class: application.children[argument],
                                     },
                                 )
                             }) {
                                 self.insert_produces(
                                     expression,
-                                    egraph.canonical(TypedClass {
+                                    TypedClass {
                                         sort: schema.output,
-                                        class: enode.output,
-                                    }),
+                                        class: application.output,
+                                    },
                                 );
                             }
                         }
@@ -922,181 +1184,74 @@ where
         }
     }
 
-    fn recheck_context<P>(&mut self, pwz: &Pwz<P>, egraph: &impl EGraphView<C>, context: ContextId)
-    where
-        P: TokenClasses<C> + Clone,
-    {
-        let Context::Seq {
-            memo,
-            symbol,
-            left,
-            right,
-        } = pwz.contexts[&context].clone()
-        else {
-            if let Context::Alt { memo } = pwz.contexts[&context] {
-                let outer = Site::Memo(memo);
-                if self.is_realizable_site(outer) {
-                    self.insert_realizable(Site::Context(context));
-                }
-                for value in self.closure.realizable_for.values(outer) {
-                    self.insert_realizable_for(Site::Context(context), value);
-                }
-            }
-            return;
+    fn recheck_context(
+        &mut self,
+        pwz: &Pwz<TokenValues>,
+        egraph: &EgglogBackend,
+        context: ContextId,
+    ) {
+        let memo = match pwz.contexts[&context] {
+            Context::Top => return,
+            Context::Alt { memo } | Context::Seq { memo, .. } => memo,
         };
-
         let outer = Site::Memo(memo);
         if self.is_realizable_site(outer) {
             self.insert_realizable(Site::Context(context));
+            return;
         }
-        let demands = self.closure.realizable_for.values(outer);
-        match symbol {
-            Symbol::Token(_) => {}
-            Symbol::Bottom => {
-                self.recheck_project_context(
-                    egraph,
-                    context,
-                    context_child(&left, &right, 1),
-                    &demands,
-                );
-            }
-            Symbol::Grammar(action) => match self.schema.actions[action as usize].clone() {
-                SemanticAction::Project { position } => self.recheck_project_context(
-                    egraph,
-                    context,
-                    context_child(&left, &right, position),
-                    &demands,
-                ),
-                SemanticAction::Construct {
-                    constructor,
-                    arguments,
-                } => {
-                    let schema = self.schema.constructors[constructor].clone();
-                    for demand in demands {
-                        if demand.sort != schema.output {
-                            continue;
-                        }
-                        for enode in egraph.enodes(constructor) {
-                            let output = egraph.canonical(TypedClass {
-                                sort: schema.output,
-                                class: enode.output,
-                            });
-                            if output != demand {
-                                continue;
-                            }
-                            let mut hole = None;
-                            let fixed_match =
-                                arguments.iter().enumerate().all(|(argument, position)| {
-                                    match context_child(&left, &right, *position) {
-                                        Child::Hole => {
-                                            hole = Some(argument);
-                                            true
-                                        }
-                                        Child::Fixed(expression) => self.has_produces(
-                                            egraph,
-                                            expression,
-                                            TypedClass {
-                                                sort: schema.inputs[argument],
-                                                class: enode.children[argument],
-                                            },
-                                        ),
-                                    }
-                                });
-                            if !fixed_match {
-                                continue;
-                            }
-                            if let Some(argument) = hole {
-                                self.insert_realizable_for(
-                                    Site::Context(context),
-                                    egraph.canonical(TypedClass {
-                                        sort: schema.inputs[argument],
-                                        class: enode.children[argument],
-                                    }),
-                                );
-                            } else {
-                                self.insert_realizable(Site::Context(context));
-                            }
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    fn recheck_project_context(
-        &mut self,
-        egraph: &impl EGraphView<C>,
-        context: ContextId,
-        child: Child,
-        demands: &[TypedClass<C>],
-    ) {
-        match child {
-            Child::Hole => {
-                for &demand in demands {
-                    self.insert_realizable_for(Site::Context(context), demand);
-                }
-            }
-            Child::Fixed(expression) => {
-                if demands
-                    .iter()
-                    .any(|demand| self.has_produces(egraph, expression, *demand))
-                {
-                    self.insert_realizable(Site::Context(context));
-                }
-            }
+        for demand in self.closure.realizable_for.values(outer) {
+            self.propagate_context_demand(pwz, egraph, context, demand);
         }
     }
 
     fn has_produces(
         &self,
-        egraph: &impl EGraphView<C>,
+        egraph: &EgglogBackend,
         expression: ExpressionId,
-        value: TypedClass<C>,
+        value: TypedClass<ValueId>,
     ) -> bool {
-        let value = egraph.canonical(value);
         self.closure
             .produces
             .values(expression)
             .into_iter()
-            .any(|candidate| egraph.canonical(candidate) == value)
+            .any(|candidate| egraph.equivalent(candidate, value))
     }
 
     fn has_realizable_for(
         &self,
-        egraph: &impl EGraphView<C>,
+        egraph: &EgglogBackend,
         site: Site,
-        value: TypedClass<C>,
+        value: TypedClass<ValueId>,
     ) -> bool {
-        let value = egraph.canonical(value);
         self.closure
             .realizable_for
             .values(site)
             .into_iter()
-            .any(|candidate| egraph.canonical(candidate) == value)
+            .any(|candidate| egraph.equivalent(candidate, value))
     }
 
-    fn focus_classes<P: TokenClasses<C>>(
+    fn focus_classes(
         &self,
-        focus: &ExpressionNode<P>,
-    ) -> SmallVec<[TypedClass<C>; 2]> {
+        focus: &ExpressionNode<TokenValues>,
+    ) -> SmallVec<[TypedClass<ValueId>; 2]> {
         let mut classes = SmallVec::new();
         if let ExpressionNode::Seq {
             symbol: Symbol::Token(token),
             ..
         } = focus
         {
-            classes.extend_from_slice(token.payload.classes());
+            classes.extend_from_slice(&token.payload);
         }
         classes
     }
 
-    fn insert_produces(&mut self, expression: ExpressionId, value: TypedClass<C>) {
+    fn insert_produces(&mut self, expression: ExpressionId, value: TypedClass<ValueId>) {
         if self.closure.produces.insert(expression, value) {
             self.agenda.push(Event::Produces(expression, value));
         }
     }
 
-    fn insert_realizable_for(&mut self, site: Site, value: TypedClass<C>) {
+    fn insert_realizable_for(&mut self, site: Site, value: TypedClass<ValueId>) {
         if self.closure.realizable_for.insert(site, value) {
             self.agenda.push(Event::RealizableFor(site, value));
         }
@@ -1162,336 +1317,4 @@ fn products<C: Copy>(choices: &[Vec<TypedClass<C>>]) -> Vec<Vec<TypedClass<C>>> 
         products = next;
     }
     products
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        ConstructorSchema, EGraphChange, EGraphView, Enode, RealizabilityEngine, Schema,
-        SemanticAction, TokenClasses, TypedClass,
-    };
-    use crate::paper_pwz::{
-        ExpressionId as E, ExpressionNode, Grammar, Pwz, Symbol, Token, Zipper,
-    };
-
-    const SORT: usize = 0;
-    const A: u32 = 0;
-    const B: u32 = 1;
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct Payload(Vec<TypedClass<u32>>);
-
-    impl TokenClasses<u32> for Payload {
-        fn classes(&self) -> &[TypedClass<u32>] {
-            &self.0
-        }
-    }
-
-    #[derive(Default)]
-    struct TestEGraph {
-        parents: Vec<u32>,
-        targets: Vec<TypedClass<u32>>,
-        terminals: Vec<Vec<TypedClass<u32>>>,
-        constructors: Vec<Vec<Enode<u32>>>,
-    }
-
-    impl TestEGraph {
-        fn ensure_class(&mut self, class: u32) {
-            while self.parents.len() <= class as usize {
-                self.parents.push(self.parents.len() as u32);
-            }
-        }
-
-        fn find(&self, mut class: u32) -> u32 {
-            while self.parents[class as usize] != class {
-                class = self.parents[class as usize];
-            }
-            class
-        }
-
-        fn merge(&mut self, left: u32, right: u32) {
-            self.ensure_class(left.max(right));
-            let left = self.find(left);
-            let right = self.find(right);
-            self.parents[left as usize] = right;
-        }
-
-        fn target(&mut self, class: u32) {
-            self.ensure_class(class);
-            self.targets.push(typed(class));
-        }
-
-        fn terminal(&mut self, terminal: u32, class: u32) {
-            self.ensure_class(class);
-            if self.terminals.len() <= terminal as usize {
-                self.terminals.resize_with(terminal as usize + 1, Vec::new);
-            }
-            self.terminals[terminal as usize].push(typed(class));
-        }
-
-        fn enode(&mut self, constructor: usize, output: u32, children: &[u32]) {
-            self.ensure_class(children.iter().copied().chain([output]).max().unwrap());
-            if self.constructors.len() <= constructor {
-                self.constructors.resize_with(constructor + 1, Vec::new);
-            }
-            self.constructors[constructor].push(Enode {
-                output,
-                children: children.into(),
-            });
-        }
-    }
-
-    impl EGraphView<u32> for TestEGraph {
-        fn canonical(&self, value: TypedClass<u32>) -> TypedClass<u32> {
-            TypedClass {
-                sort: value.sort,
-                class: self.find(value.class),
-            }
-        }
-
-        fn targets(&self) -> &[TypedClass<u32>] {
-            &self.targets
-        }
-
-        fn terminal_classes(&self, terminal: u32) -> &[TypedClass<u32>] {
-            self.terminals
-                .get(terminal as usize)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-        }
-
-        fn enodes(&self, constructor: usize) -> &[Enode<u32>] {
-            self.constructors
-                .get(constructor)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-        }
-    }
-
-    fn typed(class: u32) -> TypedClass<u32> {
-        TypedClass { sort: SORT, class }
-    }
-
-    fn payload(classes: &[u32]) -> Payload {
-        Payload(classes.iter().copied().map(typed).collect())
-    }
-
-    fn grammar(
-        nodes: impl IntoIterator<Item = (u32, ExpressionNode<Payload>)>,
-    ) -> Grammar<Payload> {
-        Grammar {
-            root: E(0),
-            expressions: nodes.into_iter().map(|(id, node)| (E(id), node)).collect(),
-            select: Default::default(),
-        }
-    }
-
-    fn tok(terminal: u32) -> ExpressionNode<Payload> {
-        ExpressionNode::Tok(terminal)
-    }
-
-    fn seq(action: u32, children: &[u32]) -> ExpressionNode<Payload> {
-        ExpressionNode::Seq {
-            symbol: Symbol::Grammar(action),
-            children: children.iter().copied().map(E).collect(),
-        }
-    }
-
-    fn schema(actions: Vec<SemanticAction>, constructors: Vec<ConstructorSchema>) -> Schema {
-        Schema {
-            actions: actions.into(),
-            constructors: constructors.into(),
-        }
-    }
-
-    fn constructor(inputs: usize) -> ConstructorSchema {
-        ConstructorSchema {
-            inputs: vec![SORT; inputs].into(),
-            output: SORT,
-        }
-    }
-
-    fn step(
-        parser: &mut Pwz<Payload>,
-        engine: &mut RealizabilityEngine<u32>,
-        egraph: &TestEGraph,
-        terminal: u32,
-        values: &[u32],
-    ) -> Vec<Zipper<Payload>> {
-        let derivative = parser.derive(Token {
-            terminal,
-            payload: payload(values),
-        });
-        let zippers = derivative.zippers.to_vec();
-        let edits = derivative.edits.to_vec();
-        engine.update_pwz(parser, &edits, egraph);
-        zippers
-    }
-
-    #[test]
-    fn initial_prefix_uses_future_grammar_and_target_eclass() {
-        let grammar = grammar([(0, seq(0, &[1, 2])), (1, tok(A)), (2, tok(B))]);
-        let schema = schema(
-            vec![SemanticAction::Construct {
-                constructor: 0,
-                arguments: vec![0, 1].into(),
-            }],
-            vec![constructor(2)],
-        );
-        let mut egraph = TestEGraph::default();
-        egraph.terminal(A, 10);
-        egraph.terminal(B, 20);
-        egraph.enode(0, 30, &[10, 20]);
-        egraph.target(30);
-
-        let parser = Pwz::new(grammar);
-        let engine = RealizabilityEngine::new(schema, &parser, &egraph);
-
-        assert!(engine.is_realizable(&parser.zippers, &egraph));
-    }
-
-    #[test]
-    fn late_target_and_terminal_facts_do_not_rebuild_the_parser_product() {
-        let grammar = grammar([(0, seq(0, &[1])), (1, tok(A))]);
-        let schema = schema(vec![SemanticAction::Project { position: 0 }], Vec::new());
-        let mut egraph = TestEGraph::default();
-        egraph.ensure_class(6);
-        let parser = Pwz::new(grammar);
-        let mut engine = RealizabilityEngine::new(schema, &parser, &egraph);
-        assert!(!engine.is_realizable(&parser.zippers, &egraph));
-
-        egraph.target(6);
-        egraph.terminal(A, 6);
-        engine.update_egraph(
-            &parser,
-            &[EGraphChange::Target, EGraphChange::Terminal(A)],
-            &egraph,
-        );
-        assert!(engine.is_realizable(&parser.zippers, &egraph));
-    }
-
-    #[test]
-    fn exact_focus_and_late_merge_complete_the_cached_product() {
-        let grammar = grammar([(0, seq(0, &[1, 2])), (1, tok(A)), (2, tok(B))]);
-        let schema = schema(
-            vec![SemanticAction::Construct {
-                constructor: 0,
-                arguments: vec![0, 1].into(),
-            }],
-            vec![constructor(2)],
-        );
-        let mut egraph = TestEGraph::default();
-        egraph.terminal(B, 4);
-        egraph.enode(0, 9, &[1, 4]);
-        egraph.target(9);
-        egraph.ensure_class(2);
-        let mut parser = Pwz::new(grammar);
-        let mut engine = RealizabilityEngine::new(schema, &parser, &egraph);
-
-        let zippers = step(&mut parser, &mut engine, &egraph, A, &[2]);
-        assert!(!engine.is_realizable(&zippers, &egraph));
-
-        // The matching row is re-emitted after rebuild. This case deliberately
-        // chooses the already-produced class as the winner: merely copying
-        // relation facts on union would do no work and miss the new match.
-        egraph.merge(1, 2);
-        engine.update_egraph(&parser, &[EGraphChange::Constructor(0)], &egraph);
-        assert!(engine.is_realizable(&zippers, &egraph));
-    }
-
-    #[test]
-    fn late_enode_uses_existing_parser_relations_without_replay() {
-        let grammar = grammar([(0, seq(0, &[1, 2])), (1, tok(A)), (2, tok(B))]);
-        let schema = schema(
-            vec![SemanticAction::Construct {
-                constructor: 0,
-                arguments: vec![0, 1].into(),
-            }],
-            vec![constructor(2)],
-        );
-        let mut egraph = TestEGraph::default();
-        egraph.terminal(B, 4);
-        egraph.target(9);
-        egraph.ensure_class(9);
-        let mut parser = Pwz::new(grammar);
-        let mut engine = RealizabilityEngine::new(schema, &parser, &egraph);
-        let zippers = step(&mut parser, &mut engine, &egraph, A, &[1]);
-        assert!(!engine.is_realizable(&zippers, &egraph));
-
-        egraph.enode(0, 9, &[1, 4]);
-        let work = engine.update_egraph(&parser, &[EGraphChange::Constructor(0)], &egraph);
-        assert!(work > 0);
-        assert!(engine.is_realizable(&zippers, &egraph));
-    }
-
-    #[test]
-    fn action_which_ignores_focus_uses_realizable_without_a_fake_value() {
-        let grammar = grammar([(0, seq(0, &[1])), (1, tok(A))]);
-        let schema = schema(
-            vec![SemanticAction::Construct {
-                constructor: 0,
-                arguments: Vec::new().into(),
-            }],
-            vec![constructor(0)],
-        );
-        let mut egraph = TestEGraph::default();
-        egraph.enode(0, 7, &[]);
-        egraph.target(7);
-        let mut parser = Pwz::new(grammar);
-        let mut engine = RealizabilityEngine::new(schema, &parser, &egraph);
-
-        let zippers = step(&mut parser, &mut engine, &egraph, A, &[]);
-        assert!(engine.is_realizable(&zippers, &egraph));
-    }
-
-    #[test]
-    fn left_recursive_context_cycle_closes_once_and_keeps_projection() {
-        // E ::= E A {$1} | B {$1}
-        let grammar = grammar([
-            (
-                0,
-                ExpressionNode::Alt {
-                    children: vec![E(1), E(2)],
-                },
-            ),
-            (1, seq(0, &[0, 3])),
-            (2, seq(1, &[4])),
-            (3, tok(A)),
-            (4, tok(B)),
-        ]);
-        let schema = schema(
-            vec![
-                SemanticAction::Project { position: 0 },
-                SemanticAction::Project { position: 0 },
-            ],
-            Vec::new(),
-        );
-        let mut egraph = TestEGraph::default();
-        egraph.terminal(B, 5);
-        egraph.target(5);
-        let mut parser = Pwz::new(grammar);
-        let mut engine = RealizabilityEngine::new(schema, &parser, &egraph);
-
-        let mut zippers = step(&mut parser, &mut engine, &egraph, B, &[5]);
-        assert!(engine.is_realizable(&zippers, &egraph));
-        for _ in 0..4 {
-            zippers = step(&mut parser, &mut engine, &egraph, A, &[]);
-            assert!(engine.is_realizable(&zippers, &egraph));
-        }
-        assert!(engine.fact_count() < 200);
-    }
-
-    #[test]
-    fn absence_of_a_witness_remains_only_a_negative_positive_query() {
-        let grammar = grammar([(0, seq(0, &[1])), (1, tok(A))]);
-        let schema = schema(vec![SemanticAction::Project { position: 0 }], Vec::new());
-        let mut egraph = TestEGraph::default();
-        egraph.target(2);
-        egraph.ensure_class(3);
-        let mut parser = Pwz::new(grammar);
-        let mut engine = RealizabilityEngine::new(schema, &parser, &egraph);
-        let zippers = step(&mut parser, &mut engine, &egraph, A, &[3]);
-
-        assert!(!engine.is_realizable(&zippers, &egraph));
-    }
 }

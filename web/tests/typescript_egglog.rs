@@ -11,22 +11,11 @@ enum Classification {
 }
 
 fn equivalent(egraph: &mut EGraph, left: &str, right: &str) -> bool {
-    let left = egraph
+    let commands = egraph
         .parser
-        .get_expr_from_string(None, left)
-        .expect("left expression should parse");
-    let right = egraph
-        .parser
-        .get_expr_from_string(None, right)
-        .expect("right expression should parse");
-    let (left_sort, left) = egraph
-        .eval_expr(&left)
-        .expect("left expression should typecheck");
-    let (right_sort, right) = egraph
-        .eval_expr(&right)
-        .expect("right expression should typecheck");
-    assert_eq!(left_sort.name(), right_sort.name());
-    egraph.get_canonical_value(left, &left_sort) == egraph.get_canonical_value(right, &right_sort)
+        .get_program_from_string(None, &format!("(check (= {left} {right}))"))
+        .expect("equality check should parse");
+    egraph.run_program(commands).is_ok()
 }
 
 fn classify(term: &str) -> Option<Classification> {
@@ -62,6 +51,7 @@ fn concrete_valid_ast_terms_rewrite_to_accept() {
         "(Analyze (LetDeclaration (StringAnnotation) (Add (TrueLiteral) (StringLiteral))))",
         "(Analyze (LetDeclaration (NumberAnnotation) (Property (StringLiteral) \"length\")))",
         "(Analyze (LetDeclaration (BooleanAnnotation) (LessThan (TrueLiteral) (FalseLiteral))))",
+        "(Analyze (LetDeclaration (NumberAnnotation) (Call (Identifier \"Number\") (Call (Identifier \"Number\") (NumberLiteral)))))",
     ] {
         assert_eq!(classify(term), Some(Classification::Accept), "{term}");
     }
@@ -86,6 +76,27 @@ fn expression_error_is_poison_through_enclosing_operators() {
         "(Multiply (NumberLiteral) (Add (NumberLiteral) (TrueLiteral)))))"
     );
     assert_eq!(classify(term), Some(Classification::Reject));
+}
+
+#[test]
+fn number_expression_has_a_recursive_call_representative() {
+    let mut egraph = EGraph::default();
+    egraph
+        .parse_and_run_program(None, DEFAULT_EGGLOG_PROGRAM)
+        .expect("TypeScript Egglog program should load");
+    for _ in 0..=MAX_TEST_ROUNDS {
+        if equivalent(
+            &mut egraph,
+            "(NumberExpression)",
+            "(Call (NumberFunctionExpression) (NumberExpression))",
+        ) {
+            return;
+        }
+        egraph
+            .step_rules("")
+            .expect("TypeScript rules should execute");
+    }
+    panic!("NumberExpression did not acquire its recursive call representative");
 }
 
 #[test]

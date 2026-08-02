@@ -11,7 +11,7 @@ resolver = "3"
 
 [dependencies]
 cfgrammar = "=0.15.0"
-egglog = { version = "=2.0.0", default-features = false }
+egglog = { git = "https://github.com/egraphs-good/egglog", rev = "53b9721b9706741edff2b7c1e379fc37137184d9", default-features = false }
 lrlex = "=0.15.0"
 regex = "=1.13.1"
 regex-automata = "=0.4.16"

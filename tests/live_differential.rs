@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use prefixspace::{Grammar, LivePrefixMonitor};
+use prefixspace::{Grammar, Monitor};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Lexeme {
@@ -50,6 +50,23 @@ fn has_target_completion(
     })
 }
 
+fn expected_answer(
+    completions: &[Completion],
+    prefix: &[Lexeme],
+    target_class: &HashSet<Ast>,
+) -> Option<bool> {
+    if has_target_completion(completions, prefix, target_class) {
+        Some(true)
+    } else if completions
+        .iter()
+        .any(|completion| completion.word.starts_with(prefix))
+    {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 fn fixed_length_words(alphabet: &[Lexeme], length: usize) -> Vec<Vec<Lexeme>> {
     let mut words = vec![Vec::new()];
     for _ in 0..length {
@@ -83,22 +100,22 @@ fn assert_matches_finite_oracle(
     // Every shorter word occurs as a prefix of a word of this fixed length,
     // so this uses fewer monitor constructions while checking all prefixes.
     for stream in fixed_length_words(alphabet, maximum_length) {
-        let mut monitor = LivePrefixMonitor::from_egglog(grammar, egraph, binding).unwrap();
+        let mut monitor = Monitor::new(grammar, egraph, binding).unwrap();
         let mut prefix = Vec::new();
-        let expected = has_target_completion(completions, &prefix, target_class);
+        let expected = expected_answer(completions, &prefix, target_class);
         assert_eq!(
-            !monitor.intersection_is_empty(),
+            monitor.realizability(),
             expected,
             "{case_name}: prefix={prefix:?}"
         );
 
         for lexeme in stream {
             prefix.push(lexeme);
-            let is_empty = monitor
+            let answer = monitor
                 .push_token_name(lexeme.terminal, lexeme.text)
                 .unwrap();
-            let expected = has_target_completion(completions, &prefix, target_class);
-            assert_eq!(!is_empty, expected, "{case_name}: prefix={prefix:?}");
+            let expected = expected_answer(completions, &prefix, target_class);
+            assert_eq!(answer, expected, "{case_name}: prefix={prefix:?}");
         }
     }
 }
@@ -461,102 +478,33 @@ fn finite_oracle_covers_selected_lexeme_behind_nullable_holes() {
     );
 }
 
-fn push_prefix(monitor: &mut LivePrefixMonitor, prefix: &[Lexeme]) {
-    for lexeme in prefix {
-        monitor
-            .push_token_name(lexeme.terminal, lexeme.text)
-            .unwrap();
-    }
-}
-
 #[test]
-fn child_merge_before_and_after_the_same_prefix_converges() {
-    let grammar = ignored_holes_grammar();
-    let merged_program = format!("{IGNORED_HOLES_EGRAPH}\n(union $good $bad)");
-    let prefixes = [
-        vec![],
-        vec![Lexeme::new("C", "c")],
-        vec![Lexeme::new("A", "a"), Lexeme::new("C", "c")],
-        vec![Lexeme::new("C", "c"), Lexeme::new("D", "d")],
-    ];
-    let merged_target = HashSet::from([Ast::Root(boxed(Ast::Good)), Ast::Root(boxed(Ast::Bad))]);
-    let completions = ignored_holes_completions();
+fn one_grammar_expression_can_supply_distinct_constructor_arguments() {
+    let grammar = Grammar::from_yacc(
+        r#"
+        %start start
+        %token A B
+        %%
+        deep: B { BVal() };
+        value: A { AVal() }
+             | deep { $1 }
+             ;
+        start: value value { Pair(1, 2) };
+        "#,
+    )
+    .unwrap();
+    let monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (AVal) (BVal) (Pair Ast Ast))
+        (let $root (Pair (AVal) (BVal)))
+        "#,
+        "$root",
+    )
+    .unwrap();
 
-    for prefix in prefixes {
-        let expected = has_target_completion(&completions, &prefix, &merged_target);
-
-        let mut initially_merged =
-            LivePrefixMonitor::from_egglog(&grammar, &merged_program, "$root").unwrap();
-        push_prefix(&mut initially_merged, &prefix);
-
-        let mut merged_before =
-            LivePrefixMonitor::from_egglog(&grammar, IGNORED_HOLES_EGRAPH, "$root").unwrap();
-        merged_before.run_egglog("(union $good $bad)").unwrap();
-        push_prefix(&mut merged_before, &prefix);
-
-        let mut merged_after =
-            LivePrefixMonitor::from_egglog(&grammar, IGNORED_HOLES_EGRAPH, "$root").unwrap();
-        push_prefix(&mut merged_after, &prefix);
-        merged_after.run_egglog("(union $good $bad)").unwrap();
-
-        assert_eq!(!initially_merged.intersection_is_empty(), expected);
-        assert_eq!(
-            merged_before.intersection_is_empty(),
-            initially_merged.intersection_is_empty(),
-            "merge-before mismatch at {prefix:?}"
-        );
-        assert_eq!(
-            merged_after.intersection_is_empty(),
-            initially_merged.intersection_is_empty(),
-            "merge-after mismatch at {prefix:?}"
-        );
-    }
-}
-
-#[test]
-fn selected_lexeme_merge_before_and_after_prefix_converges() {
-    let grammar = lexical_holes_grammar();
-    let merged_program = format!("{LEXICAL_HOLES_EGRAPH}\n(union $root (Var \"y\"))");
-    let prefixes = [
-        vec![Lexeme::new("ID", "y")],
-        vec![Lexeme::new("LP", "lp"), Lexeme::new("ID", "y")],
-        vec![
-            Lexeme::new("LP", "lp"),
-            Lexeme::new("ID", "y"),
-            Lexeme::new("RP", "rp"),
-        ],
-    ];
-
-    for prefix in prefixes {
-        let mut initially_merged =
-            LivePrefixMonitor::from_egglog(&grammar, &merged_program, "$root").unwrap();
-        push_prefix(&mut initially_merged, &prefix);
-
-        let mut merged_before =
-            LivePrefixMonitor::from_egglog(&grammar, LEXICAL_HOLES_EGRAPH, "$root").unwrap();
-        merged_before
-            .run_egglog("(union $root (Var \"y\"))")
-            .unwrap();
-        push_prefix(&mut merged_before, &prefix);
-
-        let mut merged_after =
-            LivePrefixMonitor::from_egglog(&grammar, LEXICAL_HOLES_EGRAPH, "$root").unwrap();
-        push_prefix(&mut merged_after, &prefix);
-        assert!(merged_after.intersection_is_empty(), "prefix={prefix:?}");
-        merged_after
-            .run_egglog("(union $root (Var \"y\"))")
-            .unwrap();
-
-        assert!(!initially_merged.intersection_is_empty());
-        assert_eq!(
-            merged_before.intersection_is_empty(),
-            initially_merged.intersection_is_empty(),
-            "merge-before mismatch at {prefix:?}"
-        );
-        assert_eq!(
-            merged_after.intersection_is_empty(),
-            initially_merged.intersection_is_empty(),
-            "merge-after mismatch at {prefix:?}"
-        );
-    }
+    // Both RHS occurrences point to the same cyclic grammar expression.
+    // Its AVal fact supplies the first Pair child and its BVal fact supplies
+    // the second, so this is a completion of the empty prefix.
+    assert_eq!(monitor.realizability(), Some(true));
 }

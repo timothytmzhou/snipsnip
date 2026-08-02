@@ -1,186 +1,84 @@
-use prefixspace::{Grammar, LivePrefixMonitor};
+use prefixspace::{Grammar, Monitor};
+
+const TYPE_GRAMMAR: &str = r#"
+%start ty
+%token NUMBER STRING ARROW
+%%
+ty: atom                         { $1 }
+  | atom ARROW atom              { Function(1, 3) }
+  ;
+atom: NUMBER                     { Number() }
+    | STRING                     { StringType() }
+    ;
+"#;
 
 const TYPE_LEX: &str = r#"
 %%
-number                      'NUMBER'
-string                      'STRING'
-boolean                     'BOOLEAN'
-=>                          'ARROW'
-\[                          'LBRACKET'
-\]                          'RBRACKET'
-[A-Za-z_][A-Za-z0-9_]*      'IDENT'
-[ \t\r\n]+                  ;
+number                           'NUMBER'
+string                           'STRING'
+=>                               'ARROW'
+[ \t\r\n]+                       ;
 "#;
 
-const FREE_TYPES: &str = r#"
+const TYPE_DECLARATIONS: &str = r#"
 (datatype Type
   (Number)
   (StringType)
   (Boolean)
-  (Named String)
+  (Array Type)
   (Function Type Type)
-  (Array Type))
-(free Type TypeDisjoint)
+  (Error))
+(relation Disjoint (Type Type))
 "#;
 
-fn monitor(yacc: &str, lex: &str, suffix: &str, target: &str) -> LivePrefixMonitor {
-    let grammar = Grammar::from_yacc_lex(yacc, lex).unwrap();
-    LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        &format!("{FREE_TYPES}\n{suffix}"),
-        target,
-        "TypeDisjoint",
-    )
-    .unwrap()
+fn type_monitor(disjoint_facts: &str, target: &str) -> Monitor {
+    let grammar = Grammar::from_yacc_lex(TYPE_GRAMMAR, TYPE_LEX).unwrap();
+    let program = format!("{TYPE_DECLARATIONS}\n{disjoint_facts}\n(let $target {target})");
+    Monitor::new(&grammar, &program, "$target").unwrap()
 }
 
 #[test]
-fn free_constructor_mismatch_proves_unrealizable() {
-    let mut monitor = monitor(
-        r#"
-        %start ty
-        %token NUMBER STRING BOOLEAN ARROW LBRACKET RBRACKET IDENT
-        %%
-        ty: NUMBER { Number() }
-          | STRING { StringType() }
-          ;
-        "#,
-        TYPE_LEX,
-        "(let $target (Number))",
-        "$target",
-    );
+fn explicit_disjoint_fact_proves_a_concrete_type_unrealizable() {
+    let mut monitor = type_monitor("(Disjoint (StringType) (Number))", "(Number)");
 
     assert_eq!(monitor.realizability(), Some(true));
-    assert!(monitor.push_token_name("STRING", "string").unwrap());
-    assert_eq!(monitor.realizability(), Some(false));
+    assert_eq!(
+        monitor.push_token_name("STRING", "string").unwrap(),
+        Some(false)
+    );
 }
 
 #[test]
-fn nested_function_mismatch_is_propagated_through_the_streaming_zipper() {
-    let mut monitor = monitor(
+fn explicit_disjoint_fact_can_describe_nested_type_constructors() {
+    let mut monitor = type_monitor(
         r#"
-        %start ty
-        %token NUMBER STRING BOOLEAN ARROW LBRACKET RBRACKET IDENT
-        %%
-        ty: atom { $1 }
-          | atom ARROW ty { Function(1, 3) }
-          ;
-        atom: NUMBER { Number() }
-            | STRING { StringType() }
-            ;
+        (Disjoint
+          (Function (Number) (StringType))
+          (Function (Number) (Number)))
         "#,
-        TYPE_LEX,
-        "(let $target (Function (Number) (Function (Number) (Number))))",
-        "$target",
+        "(Function (Number) (Number))",
     );
 
-    let trace = [
-        ("NUMBER", "number"),
-        ("ARROW", "=>"),
-        ("NUMBER", "number"),
-        ("ARROW", "=>"),
-    ];
-    for (terminal, lexeme) in trace {
-        monitor.push_token_name(terminal, lexeme).unwrap();
-        assert_eq!(
-            monitor.realizability(),
-            Some(true),
-            "after {terminal} {lexeme:?}"
-        );
-    }
-    monitor.push_token_name("STRING", "string").unwrap();
-    assert_eq!(monitor.realizability(), Some(false));
-}
-
-#[test]
-fn free_constructor_fields_cover_arrays_and_primitive_names() {
-    let mut array = monitor(
-        r#"
-        %start ty
-        %token NUMBER STRING BOOLEAN ARROW LBRACKET RBRACKET IDENT
-        %%
-        ty: atom LBRACKET RBRACKET { Array(1) };
-        atom: NUMBER { Number() }
-            | STRING { StringType() }
-            ;
-        "#,
-        TYPE_LEX,
-        "(let $target (Array (Number)))",
-        "$target",
+    assert_eq!(
+        monitor.push_token_name("NUMBER", "number").unwrap(),
+        Some(true)
     );
-    array.push_token_name("STRING", "string").unwrap();
-    array.push_token_name("LBRACKET", "[").unwrap();
-    array.push_token_name("RBRACKET", "]").unwrap();
-    assert_eq!(array.realizability(), Some(false));
-
-    let mut named = monitor(
-        r#"
-        %start ty
-        %token NUMBER STRING BOOLEAN ARROW LBRACKET RBRACKET IDENT
-        %%
-        ty: IDENT { Named(1) };
-        "#,
-        TYPE_LEX,
-        "(let $target (Named \"User\"))",
-        "$target",
+    assert_eq!(monitor.push_token_name("ARROW", "=>").unwrap(), Some(true));
+    assert_eq!(
+        monitor.push_token_name("STRING", "string").unwrap(),
+        Some(false)
     );
-    named.push_token_name("IDENT", "Order").unwrap();
-    assert_eq!(named.realizability(), Some(false));
 }
 
 #[test]
-fn missing_negative_knowledge_is_unknown_not_unrealizable() {
-    let grammar = Grammar::from_yacc_lex(
-        r#"
-        %start ty
-        %token NUMBER STRING BOOLEAN ARROW LBRACKET RBRACKET IDENT
-        %%
-        ty: NUMBER { Number() }
-          | STRING { StringType() }
-          ;
-        "#,
-        TYPE_LEX,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        r#"
-        (datatype Type (Number) (StringType))
-        (relation TypeDisjoint (Type Type))
-        (let $target (Number))
-        "#,
-        "$target",
-        "TypeDisjoint",
-    )
-    .unwrap();
+fn absence_of_a_disjointness_proof_is_unknown() {
+    let mut monitor = type_monitor("", "(Number)");
 
-    monitor.push_token_name("STRING", "string").unwrap();
-    assert!(monitor.intersection_is_empty());
-    assert_eq!(monitor.realizability(), None);
+    assert_eq!(monitor.push_token_name("STRING", "string").unwrap(), None);
 }
 
 #[test]
-fn an_equality_witness_takes_precedence_over_negative_uncertainty() {
-    let mut monitor = monitor(
-        r#"
-        %start ty
-        %token NUMBER STRING BOOLEAN ARROW LBRACKET RBRACKET IDENT
-        %%
-        ty: NUMBER { Number() }
-          | STRING { StringType() }
-          ;
-        "#,
-        TYPE_LEX,
-        "(let $target (Number))",
-        "$target",
-    );
-    monitor.push_token_name("NUMBER", "number").unwrap();
-    assert!(!monitor.intersection_is_empty());
-    assert_eq!(monitor.realizability(), Some(true));
-}
-
-#[test]
-fn syntax_death_is_definitively_unrealizable() {
+fn syntactically_dead_prefix_is_definitively_unrealizable() {
     let grammar = Grammar::from_yacc(
         r#"
         %start start
@@ -190,224 +88,89 @@ fn syntax_death_is_definitively_unrealizable() {
         "#,
     )
     .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        &format!("{FREE_TYPES}\n(let $target (Number))"),
-        "$target",
-        "TypeDisjoint",
-    )
-    .unwrap();
+    let program = format!("{TYPE_DECLARATIONS}\n(let $target (Number))");
+    let mut monitor = Monitor::new(&grammar, &program, "$target").unwrap();
 
-    monitor.push_token_name("BAD", "bad").unwrap();
-    assert_eq!(monitor.realizability(), Some(false));
+    assert_eq!(monitor.push_token_name("BAD", "bad").unwrap(), Some(false));
 }
 
 #[test]
-fn merging_a_free_disjoint_pair_triggers_the_invariant() {
-    let mut monitor = monitor(
+fn an_equal_completion_wins_when_an_ambiguous_parse_is_also_disjoint() {
+    let grammar = Grammar::from_yacc(
         r#"
         %start ty
-        %token NUMBER STRING BOOLEAN ARROW LBRACKET RBRACKET IDENT
+        %token VALUE
         %%
-        ty: NUMBER { Number() };
-        "#,
-        TYPE_LEX,
-        "(let $target (Number))",
-        "$target",
-    );
-
-    let error = monitor
-        .run_egglog("(union (Number) (StringType))")
-        .unwrap_err();
-    assert!(error.to_string().contains("disjoint"), "{error}");
-}
-
-#[test]
-fn typing_rewrites_analyze_ast_nodes_instead_of_being_baked_into_the_grammar() {
-    let grammar = Grammar::from_yacc_lex(
-        r#"
-        %start goal
-        %token LET IDENT COLON NUMBER EQ NUM TRUE SEMI
-        %%
-        goal: declaration { Analyze(1) };
-        declaration: LET IDENT COLON NUMBER EQ expression SEMI { LetDeclaration(6) };
-        expression: NUM  { NumberLiteral() }
-                  | TRUE { TrueLiteral() };
-        "#,
-        r#"
-        %%
-        let                         'LET'
-        number                      'NUMBER'
-        true                        'TRUE'
-        [0-9]+                      'NUM'
-        [A-Za-z_][A-Za-z0-9_]*      'IDENT'
-        :                           'COLON'
-        =                           'EQ'
-        ;                           'SEMI'
-        [ \t\r\n]+                  ;
+        ty: VALUE { Number() }
+          | VALUE { StringType() }
+          ;
         "#,
     )
     .unwrap();
-    let declarations = r#"
-        (datatype Expr
-          (NumberLiteral)
-          (TrueLiteral)
-          (NumberExpression)
-          (BooleanExpression))
-        (datatype Declaration (LetDeclaration Expr))
-        (datatype Goal (Analyze Declaration) (Accept) (Reject))
-        (relation GoalDisjoint (Goal Goal))
-        (GoalDisjoint (Reject) (Accept))
-        (let $required (Accept))
-    "#;
     let program = format!(
         r#"
-        {declarations}
-        (birewrite (NumberLiteral) (NumberExpression))
-        (birewrite (TrueLiteral) (BooleanExpression))
-        (birewrite (Analyze (LetDeclaration (NumberExpression))) (Accept))
-        (rewrite (Analyze (LetDeclaration (BooleanExpression))) (Reject))
+        {TYPE_DECLARATIONS}
+        (Disjoint (StringType) (Number))
+        (let $target (Number))
         "#
     );
+    let mut monitor = Monitor::new(&grammar, &program, "$target").unwrap();
 
-    let mut valid = LivePrefixMonitor::from_egglog_with_local_saturation_and_disjointness(
-        &grammar,
-        &program,
-        "$required",
-        "GoalDisjoint",
-    )
-    .unwrap();
-    for (terminal, lexeme) in [
-        ("LET", "let"),
-        ("IDENT", "x"),
-        ("COLON", ":"),
-        ("NUMBER", "number"),
-        ("EQ", "="),
-        ("NUM", "1"),
-        ("SEMI", ";"),
-    ] {
-        valid.push_token_name(terminal, lexeme).unwrap();
-        assert_eq!(valid.realizability(), Some(true));
-    }
-
-    let mut invalid = LivePrefixMonitor::from_egglog_with_local_saturation_and_disjointness(
-        &grammar,
-        &program,
-        "$required",
-        "GoalDisjoint",
-    )
-    .unwrap();
-    for (terminal, lexeme) in [
-        ("LET", "let"),
-        ("IDENT", "x"),
-        ("COLON", ":"),
-        ("NUMBER", "number"),
-        ("EQ", "="),
-        ("TRUE", "true"),
-    ] {
-        invalid.push_token_name(terminal, lexeme).unwrap();
-    }
-    assert_eq!(invalid.realizability(), Some(false));
-    invalid.push_token_name("SEMI", ";").unwrap();
-    assert_eq!(invalid.realizability(), Some(false));
-
-    let mut without_rules = LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        declarations,
-        "$required",
-        "GoalDisjoint",
-    )
-    .unwrap();
-    for (terminal, lexeme) in [
-        ("LET", "let"),
-        ("IDENT", "x"),
-        ("COLON", ":"),
-        ("NUMBER", "number"),
-        ("EQ", "="),
-        ("NUM", "1"),
-        ("SEMI", ";"),
-    ] {
-        without_rules.push_token_name(terminal, lexeme).unwrap();
-    }
-    assert_eq!(without_rules.realizability(), None);
+    assert_eq!(
+        monitor.push_token_name("VALUE", "value").unwrap(),
+        Some(true)
+    );
 }
 
-#[test]
-fn completed_prefix_tree_is_automatically_run_through_local_eqsat() {
+fn locally_rewritten_monitor() -> Monitor {
     let grammar = Grammar::from_yacc(
         r#"
         %start start
-        %token BAD TAIL END
+        %token GOOD BAD TAIL
         %%
-        start: atom TAIL END { $1 };
-        atom: BAD { Bad() };
+        start: atom TAIL { $1 };
+        atom: GOOD { GoodSyntax() }
+            | BAD  { BadSyntax() }
+            ;
         "#,
     )
     .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
+    Monitor::new(
         &grammar,
         r#"
-        (datatype Ast (Good) (Bad))
-        (let $wanted (Good))
-        "#,
-        "$wanted",
-    )
-    .unwrap();
-    monitor
-        .add_managed_rewrites("(rewrite (Bad) (Good))")
-        .unwrap();
+        (datatype Result
+          (Wanted)
+          (GoodSyntax)
+          (BadSyntax)
+          (Error))
+        (relation Disjoint (Result Result))
+        (Disjoint (Error) (Wanted))
+        (let $target (Wanted))
 
-    // BAD fixes the projected AST even though TAIL END is still pending. The
-    // monitor reconstructs that zipper root, focuses it, and runs the rule.
-    assert!(!monitor.push_token_name("BAD", "bad").unwrap());
-    assert_eq!(monitor.realizability(), Some(true));
-    // The proof remains cached as the surrounding syntax advances.
-    assert!(!monitor.push_token_name("TAIL", "tail").unwrap());
-    assert_eq!(monitor.realizability(), Some(true));
+        (birewrite (GoodSyntax) (Wanted))
+        (rewrite (BadSyntax) (Error))
+        "#,
+        "$target",
+    )
+    .unwrap()
 }
 
 #[test]
-fn analyzed_fixed_error_proves_the_unfinished_prefix_unrealizable() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token ONE DOT LENGTH TAIL END
-        %%
-        start: access TAIL END { $1 };
-        access: ONE DOT LENGTH { BadLength() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        r#"
-        (datatype Type (Valid) (Error) (BadLength))
-        (relation TypeDisjoint (Type Type))
-        (TypeDisjoint (Error) (Valid))
-        (let $wanted (Valid))
-        "#,
-        "$wanted",
-        "TypeDisjoint",
-    )
-    .unwrap();
-    monitor
-        .add_managed_rewrites("(rewrite (BadLength) (Error))")
-        .unwrap();
+fn initial_rewrites_are_run_locally_before_the_parse_is_complete() {
+    let mut valid = locally_rewritten_monitor();
+    assert_eq!(valid.push_token_name("GOOD", "good").unwrap(), Some(true));
 
-    for (terminal, lexeme) in [("ONE", "1"), ("DOT", "."), ("LENGTH", "length")] {
-        monitor.push_token_name(terminal, lexeme).unwrap();
-    }
-    assert_eq!(monitor.realizability(), Some(false));
+    let mut invalid = locally_rewritten_monitor();
+    assert_eq!(invalid.push_token_name("BAD", "bad").unwrap(), Some(false));
 
-    // TAIL completes the selected access subtree, but END is still missing.
-    // The same proof remains valid when the zipper switches from a known
-    // enclosing action to a completed fixed tree.
-    monitor.push_token_name("TAIL", "tail").unwrap();
-    assert_eq!(monitor.realizability(), Some(false));
+    assert_eq!(
+        invalid.push_token_name("TAIL", "tail").unwrap(),
+        Some(false)
+    );
 }
 
 #[test]
-fn malformed_disjoint_relation_is_rejected() {
+fn disjoint_relation_must_have_the_target_sort_twice() {
     let grammar = Grammar::from_yacc(
         r#"
         %start ty
@@ -417,23 +180,23 @@ fn malformed_disjoint_relation_is_rejected() {
         "#,
     )
     .unwrap();
-    let error = LivePrefixMonitor::from_egglog_with_disjointness(
+    let error = Monitor::new(
         &grammar,
         r#"
         (datatype Type (Number))
-        (relation Wrong (Type))
-        (let $wanted (Number))
+        (relation Disjoint (Type))
+        (let $target (Number))
         "#,
-        "$wanted",
-        "Wrong",
+        "$target",
     )
     .err()
-    .expect("wrong relation schema must be rejected");
-    assert!(error.to_string().contains("must have signature"), "{error}");
+    .expect("an invalid Disjoint relation must be rejected");
+
+    assert!(error.to_string().contains("signature"), "{error}");
 }
 
 #[test]
-fn manual_disjoint_relation_also_enforces_irreflexivity() {
+fn disjoint_relation_is_irreflexive() {
     let grammar = Grammar::from_yacc(
         r#"
         %start ty
@@ -443,50 +206,23 @@ fn manual_disjoint_relation_also_enforces_irreflexivity() {
         "#,
     )
     .unwrap();
-    let error = LivePrefixMonitor::from_egglog_with_disjointness(
+    let error = Monitor::new(
         &grammar,
         r#"
         (datatype Type (Number))
-        (relation D (Type Type))
-        (D (Number) (Number))
-        (let $wanted (Number))
+        (relation Disjoint (Type Type))
+        (Disjoint (Number) (Number))
+        (let $target (Number))
         "#,
-        "$wanted",
-        "D",
+        "$target",
     )
     .err()
-    .expect("a reflexive disjoint pair must be rejected");
-    assert!(error.to_string().contains("equal pair"), "{error}");
-}
+    .expect("Disjoint(x, x) must be rejected");
+    let message = error.to_string().to_lowercase();
 
-#[test]
-fn explicit_disjoint_proof_survives_unrelated_representative_changes() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start ty
-        %token ERROR
-        %%
-        ty: ERROR { Error() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        r#"
-        (datatype Type (Valid) (Error) (ValidAlias) (ErrorAlias))
-        (relation D (Type Type))
-        (D (Error) (Valid))
-        (let $wanted (Valid))
-        "#,
-        "$wanted",
-        "D",
-    )
-    .unwrap();
-
-    monitor.push_token_name("ERROR", "error").unwrap();
-    assert_eq!(monitor.realizability(), Some(false));
-    monitor
-        .run_egglog("(union (ErrorAlias) (Error)) (union (ValidAlias) (Valid))")
-        .unwrap();
-    assert_eq!(monitor.realizability(), Some(false));
+    assert!(
+        message.contains("disjoint")
+            && (message.contains("equal") || message.contains("irreflexive")),
+        "{error}"
+    );
 }

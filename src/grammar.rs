@@ -243,7 +243,7 @@ impl LexMachine {
         // `ab` rule win by maximal munch.
         //
         // Anchored DFA start states may inspect the first byte to resolve
-        // look-around. Seed the product graph once for each possible first
+        // look-around. Initialize the product graph once for each possible first
         // byte; nullable lexer rules have already been rejected.
         for byte in u8::MIN..=u8::MAX {
             let first = [byte];

@@ -1,869 +1,300 @@
-use prefixspace::{Grammar, LiveMonitorError, LivePrefixMonitor};
+use prefixspace::{Grammar, Monitor};
 
-fn leaf_grammar() -> Grammar {
-    Grammar::from_yacc(
+fn grammar_with_action(action: &str) -> Grammar {
+    Grammar::from_yacc(&format!(
         r#"
         %start start
-        %token BAD
+        %token TOKEN
         %%
-        start: BAD { Bad() };
-        "#,
+        start: TOKEN {{ {action} }};
+        "#
+    ))
+    .unwrap()
+}
+
+fn numbered_state_grammar(alternative: bool) -> Grammar {
+    let alternative = alternative.then_some("| NUMBER { Bad() }").unwrap_or("");
+    Grammar::from_yacc_lex(
+        &format!(
+            r#"
+            %start start
+            %token NUMBER
+            %%
+            start: NUMBER {{ State(1) }}
+                 {alternative}
+                 ;
+            "#
+        ),
+        "%%\n[0-9]+ 'NUMBER'\n",
     )
     .unwrap()
 }
 
-#[test]
-fn managed_directed_rewrite_does_not_scan_an_unreachable_lhs() {
-    let grammar = Grammar::from_yacc(
+fn state_program(goal: i64, target: &str, extra: &str) -> String {
+    format!(
         r#"
-        %start start
-        %token OTHER
-        %%
-        start: OTHER { Other() };
-        "#,
+        (datatype Ast (State i64) (Bad) (Wrap Ast))
+        (relation Disjoint (Ast Ast))
+        {extra}
+        (let $root {target})
+        (rewrite (State n) (State (+ n 1)) :when ((< n {goal})))
+        "#
     )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
+}
+
+fn deeply_wrapped_state_grammar(depth: usize, number_pattern: &str) -> Grammar {
+    let mut source = String::from("%start layer0\n%token NUMBER\n%%\n");
+    for layer in 0..depth {
+        source.push_str(&format!(
+            "layer{layer}: layer{} {{ Wrap(1) }};\n",
+            layer + 1
+        ));
+    }
+    source.push_str(&format!("layer{depth}: NUMBER {{ State(1) }};\n"));
+    Grammar::from_yacc_lex(&source, &format!("%%\n{number_pattern} 'NUMBER'\n")).unwrap()
+}
+
+fn wrap(term: &str, depth: usize) -> String {
+    let mut result = String::with_capacity(term.len() + depth * 7);
+    for _ in 0..depth {
+        result.push_str("(Wrap ");
+    }
+    result.push_str(term);
+    for _ in 0..depth {
+        result.push(')');
+    }
+    result
+}
+
+#[test]
+fn initial_rewrite_applies_to_a_later_prefix() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
         &grammar,
         r#"
-        (datatype Ast (Good) (Bad) (Other))
+        (datatype Ast (Good) (Bad))
         (let $root (Good))
-        (let $bad (Bad))
+        (rewrite (Bad) (Good))
         "#,
         "$root",
     )
     .unwrap();
 
-    assert!(monitor.push_token_name("OTHER", "other").unwrap());
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good))")
-            .unwrap()
+    assert_eq!(
+        monitor.push_token_name("TOKEN", "token").unwrap(),
+        Some(true)
     );
-    assert!(monitor.intersection_is_empty());
-    assert_eq!(monitor.stats().managed_rewrite_declarations, 1);
-    assert_eq!(monitor.stats().total_basin_rule_matches, 0);
 }
 
 #[test]
-fn rewrite_installed_after_a_complete_prefix_uses_the_current_zipper_root() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
+fn late_rewrite_reconsiders_the_current_prefix() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
         &grammar,
         "(datatype Ast (Good) (Bad)) (let $root (Good))",
         "$root",
     )
     .unwrap();
 
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(monitor.intersection_is_empty());
-    assert!(
-        !monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good))")
-            .unwrap()
+    assert_eq!(monitor.push_token_name("TOKEN", "token").unwrap(), None);
+    assert_eq!(
+        monitor.run_egglog("(rewrite (Bad) (Good))").unwrap(),
+        Some(true)
     );
-    assert_eq!(monitor.realizability(), Some(true));
 }
 
 #[test]
-fn adding_a_rewrite_preserves_an_existing_explicit_negative_proof() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
+fn forward_rewrites_do_not_run_backwards() {
+    let grammar = grammar_with_action("Bad()");
+    let mut monitor = Monitor::new(
         &grammar,
         r#"
-        (datatype Ast (Good) (Bad) (Other))
-        (relation AstDisjoint (Ast Ast))
-        (AstDisjoint (Bad) (Good))
+        (datatype Ast (Good) (Bad) (Middle))
         (let $root (Good))
+        (rewrite (Middle) (Bad))
+        (rewrite (Middle) (Good))
         "#,
         "$root",
-        "AstDisjoint",
     )
     .unwrap();
 
-    monitor.push_token_name("BAD", "bad").unwrap();
-    assert_eq!(monitor.realizability(), Some(false));
-    monitor
-        .add_managed_rewrites("(rewrite (Other) (Other))")
-        .unwrap();
-    assert_eq!(monitor.realizability(), Some(false));
+    // Running the first rule backwards would create Middle(), after which the
+    // second rule would incorrectly connect this prefix to Good().
+    assert_eq!(monitor.push_token_name("TOKEN", "token").unwrap(), None);
 }
 
 #[test]
-fn initial_managed_rewrites_are_bounded_and_run_schedules_are_rejected() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token GOOD
-        %%
-        start: GOOD { Good() };
-        "#,
-    )
-    .unwrap();
-    let program = r#"
-        (datatype Ast (Good) (F Ast))
-        (let $root (F (Good)))
-        (rewrite (F value) (F (F value)))
-    "#;
-    let monitor =
-        LivePrefixMonitor::from_egglog_with_local_saturation(&grammar, program, "$root").unwrap();
-    assert_eq!(monitor.stats().managed_rewrite_declarations, 1);
-
-    let with_run = format!("{program}\n(run 1)");
-    assert!(matches!(
-        LivePrefixMonitor::from_egglog_with_local_saturation(&grammar, &with_run, "$root"),
-        Err(LiveMonitorError::UnsupportedUpdateCommand(command)) if command == "run-schedule"
-    ));
-}
-
-#[test]
-fn managed_directed_rewrites_close_a_chain_in_either_declaration_order() {
-    let grammar = leaf_grammar();
-    for rewrites in [
-        r#"
-        (rewrite (Good) (Middle))
-        (rewrite (Middle) (Bad))
-        "#,
-        r#"
-        (rewrite (Middle) (Bad))
-        (rewrite (Good) (Middle))
-        "#,
+fn birewrite_works_in_both_directions() {
+    for (candidate, bridge) in [
+        ("Left()", "(rewrite (Right) (Goal))"),
+        ("Right()", "(rewrite (Left) (Goal))"),
     ] {
-        let mut monitor = LivePrefixMonitor::from_egglog(
-            &grammar,
+        let grammar = grammar_with_action(candidate);
+        let program = format!(
             r#"
-            (datatype Ast (Good) (Middle) (Bad))
-            (let $root (Good))
-            (let $bad (Bad))
-            "#,
-            "$root",
-        )
-        .unwrap();
-        assert!(monitor.push_token_name("BAD", "bad").unwrap());
-        assert!(!monitor.add_managed_rewrites(rewrites).unwrap());
+            (datatype Ast (Goal) (Left) (Right))
+            (let $root (Goal))
+            (birewrite (Left) (Right))
+            {bridge}
+            "#
+        );
+        let mut monitor = Monitor::new(&grammar, &program, "$root").unwrap();
+
+        assert_eq!(
+            monitor.push_token_name("TOKEN", "token").unwrap(),
+            Some(true),
+            "candidate {candidate}"
+        );
     }
 }
 
 #[test]
-fn managed_birewrites_construct_a_missing_intermediate_in_the_target_basin() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
+fn rewrites_ignore_large_unrelated_data() {
+    let grammar = grammar_with_action("Bad()");
+    let mut program = String::from(
         r#"
-        (datatype Ast (Good) (Middle) (Bad))
+        (datatype Ast (Good) (Bad) (Middle) (Junk i64))
         (let $root (Good))
-        (let $bad (Bad))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(
-        !monitor
-            .add_managed_rewrites(
-                r#"
-                (birewrite (Bad) (Middle))
-                (birewrite (Middle) (Good))
-                "#,
-            )
-            .unwrap()
-    );
-    let stats = monitor.stats();
-    assert!(stats.total_basin_rule_matches > 0);
-}
-
-#[test]
-fn managed_birewrite_descends_through_an_existing_unmentioned_context() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token LEAF
-        %%
-        start: LEAF { Leaf() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Child (U) (V))
-        (datatype Ast (Good) (Leaf) (F Child))
-        (let $root (Good))
-        (let $fu (F (U)))
-        (let $fv (F (V)))
-        (let $leaf (Leaf))
-        (union $root $fu)
-        (union $leaf $fv)
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("LEAF", "leaf").unwrap());
-
-    // F occurs in neither the grammar nor the rewrite. Target-basin
-    // saturation merges U/V and then connects Good/Leaf by congruence, so the
-    // basin must nevertheless project through the existing F rows.
-    assert!(!monitor.add_managed_rewrites("(birewrite (U) (V))").unwrap());
-    assert!(monitor.stats().total_basin_rule_matches > 0);
-}
-
-#[test]
-fn late_context_declaration_recloses_existing_birewrites() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token LEAF
-        %%
-        start: LEAF { Leaf() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Child (U) (V))
-        (datatype Ast (Good) (Leaf))
-        (let $root (Good))
-        (let $leaf (Leaf))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("LEAF", "leaf").unwrap());
-    assert!(monitor.add_managed_rewrites("(birewrite (U) (V))").unwrap());
-    assert!(
-        !monitor
-            .run_egglog(
-                r#"
-                (constructor F (Child) Ast)
-                (let $fu (F (U)))
-                (let $fv (F (V)))
-                (union $root $fu)
-                (union $leaf $fv)
-                "#,
-            )
-            .unwrap()
-    );
-}
-
-#[test]
-fn context_declared_before_a_partial_update_error_is_still_projected() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token LEAF
-        %%
-        start: LEAF { Leaf() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Child (U) (V))
-        (datatype Ast (Good) (Leaf))
-        (let $root (Good))
-        (let $leaf (Leaf))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("LEAF", "leaf").unwrap());
-    assert!(monitor.add_managed_rewrites("(birewrite (U) (V))").unwrap());
-    let result = monitor.run_egglog(
-        r#"
-        (constructor F (Child) Ast)
-        (let $fu (F (U)))
-        (let $fv (F (V)))
-        (union $root $fu)
-        (union $leaf $fv)
-        (let $oops (missing-function))
+        (rewrite (Junk value) (Middle))
+        (rewrite (Middle) (Bad))
+        (rewrite (Middle) (Good))
         "#,
     );
-    assert!(matches!(result, Err(LiveMonitorError::Egglog(_))));
-    assert!(!monitor.intersection_is_empty());
-}
-
-#[test]
-fn managed_directed_rules_skip_an_unrelated_common_ancestor_path() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token LEAF
-        %%
-        start: LEAF { Leaf() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Leaf) (U) (Middle))
-        (let $root (Good))
-        (let $leaf (Leaf))
-        (let $unrelated (U))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("LEAF", "leaf").unwrap());
-    assert!(
-        monitor
-            .add_managed_rewrites(
-                r#"
-                (rewrite (U) (Middle))
-                (rewrite (Middle) (Good))
-                (rewrite (Middle) (Leaf))
-                "#,
-            )
-            .unwrap()
-    );
-    assert!(monitor.intersection_is_empty());
-    assert_eq!(monitor.stats().total_basin_rule_matches, 0);
-}
-
-#[test]
-fn managed_directions_reclose_regardless_of_registration_order() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token U_TOKEN
-        %%
-        start: U_TOKEN { U() };
-        "#,
-    )
-    .unwrap();
-    for ordinary_first in [false, true] {
-        let mut monitor = LivePrefixMonitor::from_egglog(
-            &grammar,
-            r#"
-            (datatype Ast (Good) (U) (Middle))
-            (let $root (Good))
-            (let $source (U))
-            "#,
-            "$root",
-        )
-        .unwrap();
-        assert!(monitor.push_token_name("U_TOKEN", "u").unwrap());
-        if ordinary_first {
-            assert!(
-                monitor
-                    .add_managed_rewrites("(rewrite (Middle) (U))")
-                    .unwrap()
-            );
-            assert!(
-                !monitor
-                    .add_managed_rewrites("(birewrite (Good) (Middle))")
-                    .unwrap()
-            );
-        } else {
-            assert!(
-                monitor
-                    .add_managed_rewrites("(birewrite (Good) (Middle))")
-                    .unwrap()
-            );
-            assert!(
-                !monitor
-                    .add_managed_rewrites("(rewrite (Middle) (U))")
-                    .unwrap()
-            );
-        }
-        assert!(monitor.stats().total_basin_rule_matches > 0);
+    for value in 0..512 {
+        program.push_str(&format!("(let $junk-{value} (Junk {value}))\n"));
     }
+    let mut monitor = Monitor::new(&grammar, &program, "$root").unwrap();
+
+    // If the first rule scanned outside the target/fixed-prefix focus, any
+    // Junk value would connect Bad() and Good() through Middle().
+    assert_eq!(monitor.push_token_name("TOKEN", "token").unwrap(), None);
 }
 
 #[test]
-fn large_managed_birewrite_chain_stays_in_the_target_basin() {
-    const DEPTH: usize = 128;
+fn fixed_prefix_focus_crosses_ignored_pending_syntax() {
     let grammar = Grammar::from_yacc(
         r#"
         %start start
-        %token TOKEN
+        %token BAD TAIL
         %%
-        start: TOKEN { N0() };
-        "#,
-    )
-    .unwrap();
-    let mut program = String::from("(datatype Ast");
-    for index in 0..=DEPTH {
-        program.push_str(&format!(" (N{index})"));
-    }
-    program.push_str(")\n");
-    program.push_str(&format!("(let $root (N{DEPTH}))\n"));
-    let mut rewrites = String::new();
-    for index in 0..DEPTH {
-        rewrites.push_str(&format!("(birewrite (N{index}) (N{}))\n", index + 1));
-    }
-
-    let mut monitor = LivePrefixMonitor::from_egglog(&grammar, &program, "$root").unwrap();
-    assert!(monitor.push_token_name("TOKEN", "token").unwrap());
-    assert!(!monitor.add_managed_rewrites(&rewrites).unwrap());
-    let stats = monitor.stats();
-    assert!(stats.total_basin_rule_matches >= DEPTH);
-}
-
-#[test]
-fn expanding_managed_saturation_is_round_limited_and_resumable() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token TOKEN
-        %%
-        start: atom { F(1) };
-        atom: TOKEN { Leaf() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Leaf) (F Ast) (G Ast))
-        (let $source (F (Leaf)))
-        "#,
-        "$source",
-    )
-    .unwrap();
-    assert!(!monitor.push_token_name("TOKEN", "token").unwrap());
-
-    let error = monitor
-        .add_managed_rewrites_with_round_limit("(rewrite (F x) (F (G x)))", 3)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        LiveMonitorError::ManagedSaturationRoundLimit { rounds: 3 }
-    ));
-    let error = monitor.continue_managed_saturation(2).unwrap_err();
-    assert!(matches!(
-        error,
-        LiveMonitorError::ManagedSaturationRoundLimit { rounds: 2 }
-    ));
-}
-
-#[test]
-fn zero_round_install_is_observable_and_can_be_resumed_to_a_fixed_point() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Bad))
-        (let $root (Good))
-        "#,
-        "$root",
-    )
-    .unwrap();
-
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    let error = monitor
-        .add_managed_rewrites_with_round_limit("(birewrite (Bad) (Good))", 0)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        LiveMonitorError::ManagedSaturationRoundLimit { rounds: 0 }
-    ));
-    assert!(monitor.intersection_is_empty());
-    assert_eq!(monitor.stats().managed_rewrite_declarations, 1);
-    assert_eq!(monitor.stats().last_basin_rule_matches, 0);
-
-    assert!(!monitor.continue_managed_saturation(8).unwrap());
-    assert!(!monitor.intersection_is_empty());
-    assert!(monitor.stats().last_basin_rule_matches > 0);
-}
-
-#[test]
-fn run_egglog_round_limit_keeps_the_partial_update_and_allows_resume() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Bad) (F Ast))
-        (let $root (Good))
-        "#,
-        "$root",
-    )
-    .unwrap();
-
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (F x) (Bad))")
-            .unwrap()
-    );
-    let error = monitor
-        .run_egglog_with_managed_saturation_round_limit(
-            "(let $late-context (F $root)) (union $root $late-context)",
-            0,
-        )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        LiveMonitorError::ManagedSaturationRoundLimit { rounds: 0 }
-    ));
-    assert!(monitor.intersection_is_empty());
-
-    assert!(!monitor.continue_managed_saturation(8).unwrap());
-    assert!(!monitor.intersection_is_empty());
-}
-
-#[test]
-fn managed_birewrite_can_construct_the_missing_reverse_term() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Bad))
-        (let $root (Good))
-        "#,
-        "$root",
-    )
-    .unwrap();
-
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(
-        !monitor
-            .add_managed_rewrites("(birewrite (Bad) (Good))")
-            .unwrap()
-    );
-}
-
-#[test]
-fn registered_managed_rewrites_are_reclosed_after_later_egraph_updates() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Bad) (F Ast))
-        (let $root (Good))
-        "#,
-        "$root",
-    )
-    .unwrap();
-
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (F x) (Bad))")
-            .unwrap()
-    );
-    assert!(
-        !monitor
-            .run_egglog("(let $late-context (F $root)) (union $root $late-context)")
-            .unwrap()
-    );
-    assert!(!monitor.intersection_is_empty());
-}
-
-#[test]
-fn managed_directed_rewrite_does_not_construct_a_missing_lhs() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token OTHER
-        %%
-        start: OTHER { Other() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        "(datatype Ast (Good) (Bad) (Other)) (let $root (Good))",
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("OTHER", "other").unwrap());
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good))")
-            .unwrap()
-    );
-    assert!(monitor.intersection_is_empty());
-}
-
-#[test]
-fn managed_directed_rewrite_discovers_an_existing_simplifier_lhs() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token TOKEN
-        %%
-        start: TOKEN { Good() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (F Ast))
-        (let $good (Good))
-        (let $root (F $good))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("TOKEN", "token").unwrap());
-    assert!(!monitor.add_managed_rewrites("(rewrite (F x) x)").unwrap());
-}
-
-#[test]
-fn managed_birewrite_does_not_fire_outside_the_target_basin() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Bad) (Junk i64) (OtherJunk i64))
-        (let $root (Good))
-        (let $bad (Bad))
-        (let $junk-1 (Junk 1))
-        (let $junk-2 (Junk 2))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-
-    assert!(
-        monitor
-            .add_managed_rewrites("(birewrite (Junk value) (OtherJunk value))")
-            .unwrap()
-    );
-    assert_eq!(monitor.stats().last_basin_rule_matches, 0);
-    assert_eq!(monitor.stats().total_basin_rule_matches, 0);
-}
-
-#[test]
-fn target_basin_descends_through_non_grammar_constructors_used_by_birewrites() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token LEAF
-        %%
-        start: LEAF { Leaf() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Bad) (Good) (Leaf) (Aux Ast))
-        (let $root (Aux (Bad)))
-        (let $leaf (Leaf))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("LEAF", "leaf").unwrap());
-
-    assert!(
-        !monitor
-            .add_managed_rewrites(
-                r#"
-                (birewrite (Bad) (Good))
-                (birewrite (Leaf) (Aux (Good)))
-                "#,
-            )
-            .unwrap()
-    );
-}
-
-#[test]
-fn canonicalized_old_rows_are_reconsidered_after_a_late_union() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token WANTED
-        %%
-        start: WANTED { Wanted() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Expected) (Bad) (Good) (Wanted) (Box Ast))
-        (let $expected (Expected))
-        (let $bad (Bad))
-        (let $root (Box $expected))
-        (let $wanted (Wanted))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("WANTED", "wanted").unwrap());
-    assert!(
-        monitor
-            .add_managed_rewrites(
-                r#"
-                (rewrite (Bad) (Good))
-                (rewrite (Box (Good)) (Wanted))
-                "#,
-            )
-            .unwrap()
-    );
-    assert!(!monitor.run_egglog("(union $expected $bad)").unwrap());
-}
-
-#[test]
-fn false_condition_blocks_a_managed_directed_rewrite() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token GOOD
-        %%
-        start: GOOD { Good() };
-        "#,
-    )
-    .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Bad))
-        (let $root (Bad))
-        (let $good (Good))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("GOOD", "good").unwrap());
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good) :when ((= 0 1)))")
-            .unwrap()
-    );
-}
-
-#[test]
-fn duplicate_managed_rewrite_registration_is_idempotent() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Ast (Good) (Bad))
-        (let $root (Good))
-        (let $bad (Bad))
-        "#,
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(
-        !monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good))")
-            .unwrap()
-    );
-    let before = monitor.stats();
-    assert!(
-        !monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good))")
-            .unwrap()
-    );
-    let after = monitor.stats();
-    assert_eq!(
-        after.managed_rewrite_declarations,
-        before.managed_rewrite_declarations
-    );
-    assert_eq!(
-        after.total_basin_rule_matches,
-        before.total_basin_rule_matches
-    );
-}
-
-#[test]
-fn upgrading_a_managed_rewrite_to_birewrite_installs_only_the_missing_direction() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        "(datatype Ast (Good) (Bad)) (let $root (Good))",
-        "$root",
-    )
-    .unwrap();
-    assert!(monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(
-        !monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good))")
-            .unwrap()
-    );
-    assert!(
-        !monitor
-            .add_managed_rewrites("(birewrite (Bad) (Good))")
-            .unwrap()
-    );
-}
-
-#[test]
-fn managed_reflexive_directed_rewrite_is_safe_and_idempotent() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        "(datatype Ast (Good) (Bad)) (let $root (Good))",
-        "$root",
-    )
-    .unwrap();
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (Good) (Good))")
-            .is_ok()
-    );
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (Good) (Good))")
-            .is_ok()
-    );
-}
-
-#[test]
-fn managed_saturation_api_rejects_commands_that_are_not_rewrites() {
-    let grammar = leaf_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        "(datatype Ast (Good) (Bad)) (let $root (Good))",
-        "$root",
-    )
-    .unwrap();
-
-    assert!(matches!(
-        monitor.add_managed_rewrites("(run 1)"),
-        Err(LiveMonitorError::UnsupportedManagedSaturationCommand(command)) if command == "run-schedule"
-    ));
-    assert!(matches!(
-        monitor.add_managed_rewrites("(rule ((= x (Bad))) ((union x (Good))))"),
-        Err(LiveMonitorError::UnsupportedManagedSaturationCommand(command)) if command == "rule"
-    ));
-}
-
-#[test]
-fn lexeme_updates_run_registered_managed_rules_on_newly_fixed_trees() {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token BAD TAIL END
-        %%
-        start: atom TAIL END { $1 };
+        start: atom TAIL { Wrap(1) };
         atom: BAD { Bad() };
         "#,
     )
     .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
+    let mut monitor = Monitor::new(
         &grammar,
         r#"
-        (datatype Ast (Good) (Bad))
+        (datatype Ast (Good) (Bad) (Wrap Ast))
+        (let $root (Good))
+        (rewrite (Wrap (Bad)) (Good))
+        "#,
+        "$root",
+    )
+    .unwrap();
+
+    // TAIL is still pending, but it is absent from the semantic action. The
+    // zipper therefore exposes the fixed Wrap(Bad()) root to rewriting now.
+    assert_eq!(monitor.push_token_name("BAD", "bad").unwrap(), Some(true));
+}
+
+#[test]
+fn a_dead_parse_branch_is_not_used_by_a_late_rewrite() {
+    let grammar = Grammar::from_yacc(
+        r#"
+        %start start
+        %token A B
+        %%
+        start: A   { Dead() }
+             | A B { Bad() }
+             ;
+        "#,
+    )
+    .unwrap();
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Ast (Good) (Bad) (Dead) (Bridge))
         (let $root (Good))
         "#,
         "$root",
     )
     .unwrap();
-    assert!(
-        monitor
-            .add_managed_rewrites("(rewrite (Bad) (Good))")
-            .unwrap()
-    );
 
-    let before = monitor.stats().total_basin_rule_matches;
-    // BAD fixes the projected semantic root while TAIL END is still pending.
-    // The derivative materializes Bad(), focuses it, and automatically
-    // recloses the installed rule immediately.
-    assert!(!monitor.push_token_name("BAD", "bad").unwrap());
-    assert!(monitor.stats().total_basin_rule_matches > before);
-    let before = monitor.stats().total_basin_rule_matches;
-    assert!(!monitor.push_token_name("TAIL", "tail").unwrap());
-    assert_eq!(monitor.stats().total_basin_rule_matches, before);
-    assert!(!monitor.intersection_is_empty());
+    assert_eq!(monitor.push_token_name("A", "a").unwrap(), None);
+    assert_eq!(monitor.push_token_name("B", "b").unwrap(), None);
+    assert_eq!(
+        monitor
+            .run_egglog(
+                r#"
+                (rewrite (Dead) (Bridge))
+                (rewrite (Bridge) (Bad))
+                (rewrite (Bridge) (Good))
+                "#,
+            )
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_deep_rewrite_chain_added_by_the_next_token_reaches_its_fixpoint() {
+    let grammar = numbered_state_grammar(false);
+    let mut monitor =
+        Monitor::new(&grammar, &state_program(1_200, "(State 1200)", ""), "$root").unwrap();
+
+    assert_eq!(monitor.push_token_name("NUMBER", "0").unwrap(), Some(true));
+}
+
+#[test]
+fn initial_rewrites_reach_a_completion_through_a_deep_term() {
+    let depth = 128;
+    let grammar = deeply_wrapped_state_grammar(depth, "1800");
+    let target = wrap("(State 0)", depth);
+    let program = state_program(
+        1_800,
+        "$deep-target",
+        &format!("(let $deep-target {target})"),
+    );
+    let mut monitor = Monitor::new(&grammar, &program, "$root").unwrap();
+
+    assert_eq!(monitor.realizability(), Some(true));
+    assert_eq!(
+        monitor.push_token_name("NUMBER", "1800").unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn a_later_rule_extends_existing_equalities_to_the_current_prefix() {
+    let grammar = numbered_state_grammar(false);
+    let mut monitor =
+        Monitor::new(&grammar, &state_program(600, "(State 0)", ""), "$root").unwrap();
+
+    assert_eq!(monitor.push_token_name("NUMBER", "1200").unwrap(), None);
+    assert_eq!(
+        monitor
+            .run_egglog(r#"(rewrite (State n) (State (+ n 1)) :when ((< n 1200)))"#,)
+            .unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn a_deep_witness_prevents_an_ambiguous_prefix_from_being_rejected() {
+    let grammar = numbered_state_grammar(true);
+    let program = state_program(1_200, "(State 1200)", "(Disjoint (Bad) (State 1200))");
+    let mut monitor = Monitor::new(&grammar, &program, "$root").unwrap();
+
+    let answer = monitor.push_token_name("NUMBER", "0").unwrap();
+    assert_ne!(
+        answer,
+        Some(false),
+        "an unfinished equality proof is not an impossibility proof"
+    );
+    assert_eq!(
+        answer,
+        Some(true),
+        "the deep equal parse must be found despite the disjoint parse"
+    );
 }

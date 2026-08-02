@@ -17,10 +17,13 @@ pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
   (Modulo Expr Expr)
   (LessThan Expr Expr)
   (Property Expr String)
-  ;; These four constructors are analysis results, never parser actions.
+  (Identifier String)
+  (Call Expr Expr)
+  ;; These five constructors are analysis results, never parser actions.
   (NumberExpression)
   (StringExpression)
   (BooleanExpression)
+  (NumberFunctionExpression)
   (ExpressionError))
 
 (datatype Annotation
@@ -38,8 +41,8 @@ pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
 
 ;; A negative answer requires an explicit proof. Raw Analyze terms are not
 ;; declared disjoint from Accept: without typing rules the answer is Unknown.
-(relation GoalDisjoint (Goal Goal))
-(GoalDisjoint (Reject) (Accept))
+(relation Disjoint (Goal Goal))
+(Disjoint (Reject) (Accept))
 (let $required (Accept))
 
 ;; TypeScript typing rules (primitive strict-mode subset).
@@ -49,6 +52,24 @@ pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
 (birewrite (StringLiteral) (StringExpression))
 (birewrite (TrueLiteral) (BooleanExpression))
 (birewrite (FalseLiteral) (BooleanExpression))
+
+;; TypeScript's global Number function converts every primitive value in this
+;; subset to a number. The call birewrite gives NumberExpression a cyclic
+;; representative during initial saturation, so nested Number(...) syntax
+;; reuses one closed e-class at every depth.
+(birewrite (Identifier "Number") (NumberFunctionExpression))
+(birewrite
+  (Call (NumberFunctionExpression) (NumberExpression))
+  (NumberExpression))
+(rewrite
+  (Call (NumberFunctionExpression) (StringExpression))
+  (NumberExpression))
+(rewrite
+  (Call (NumberFunctionExpression) (BooleanExpression))
+  (NumberExpression))
+(rewrite
+  (Call (NumberFunctionExpression) (NumberFunctionExpression))
+  (NumberExpression))
 
 ;; Numeric arithmetic.
 (birewrite (Subtract (NumberExpression) (NumberExpression)) (NumberExpression))
@@ -130,5 +151,6 @@ pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
 (rewrite (Analyze (LetDeclaration (StringAnnotation) (BooleanExpression))) (Reject))
 (rewrite (Analyze (LetDeclaration (BooleanAnnotation) (NumberExpression))) (Reject))
 (rewrite (Analyze (LetDeclaration (BooleanAnnotation) (StringExpression))) (Reject))
+(rewrite (Analyze (LetDeclaration annotation (NumberFunctionExpression))) (Reject))
 (rewrite (Analyze (LetDeclaration annotation (ExpressionError))) (Reject))
 "#;

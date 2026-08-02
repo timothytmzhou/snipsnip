@@ -1,4 +1,4 @@
-use prefixspace::{Grammar, LivePrefixMonitor};
+use prefixspace::{Grammar, Monitor};
 
 #[test]
 fn lexical_sort_flows_through_project_productions() {
@@ -24,13 +24,16 @@ fn lexical_sort_flows_through_project_productions() {
 
     // The Var input schema determines that ID denotes a String even though
     // two Project actions separate the terminal from the constructor.
-    let mut accepted = LivePrefixMonitor::from_egglog(&grammar, egraph, "$root").unwrap();
-    assert!(!accepted.intersection_is_empty());
-    assert!(!accepted.push_token_name("ID", "x").unwrap());
+    let mut accepted = Monitor::new(&grammar, egraph, "$root").unwrap();
+    assert_eq!(accepted.realizability(), Some(true));
+    assert_eq!(accepted.push_token_name("ID", "x").unwrap(), Some(true));
 
-    let mut resurrected = LivePrefixMonitor::from_egglog(&grammar, egraph, "$root").unwrap();
-    assert!(resurrected.push_token_name("ID", "y").unwrap());
-    assert!(!resurrected.run_egglog("(union $root (Var \"y\"))").unwrap());
+    let mut resurrected = Monitor::new(&grammar, egraph, "$root").unwrap();
+    assert_eq!(resurrected.push_token_name("ID", "y").unwrap(), None);
+    assert_eq!(
+        resurrected.run_egglog("(union $root (Var \"y\"))").unwrap(),
+        Some(true)
+    );
 }
 
 #[test]
@@ -46,7 +49,7 @@ fn nullable_left_recursion_tracks_a_recursive_target_class() {
         "#,
     )
     .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
+    let mut monitor = Monitor::new(
         &grammar,
         r#"
         (datatype Ast (Nil) (Cons Ast))
@@ -56,14 +59,17 @@ fn nullable_left_recursion_tracks_a_recursive_target_class() {
     )
     .unwrap();
 
-    assert!(!monitor.intersection_is_empty());
-    assert!(monitor.push_token_name("X", "x").unwrap());
+    assert_eq!(monitor.realizability(), Some(true));
+    assert_eq!(monitor.push_token_name("X", "x").unwrap(), None);
 
     // The consumed prefix is unchanged.  Making the target class recursive
     // must recover Cons(Nil), Cons(Cons(Nil)), ... incrementally.
-    assert!(!monitor.run_egglog("(union $root (Cons $root))").unwrap());
+    assert_eq!(
+        monitor.run_egglog("(union $root (Cons $root))").unwrap(),
+        Some(true)
+    );
     for _ in 0..8 {
-        assert!(!monitor.push_token_name("X", "x").unwrap());
+        assert_eq!(monitor.push_token_name("X", "x").unwrap(), Some(true));
     }
 }
 
@@ -87,11 +93,11 @@ fn ambiguous_left_recursive_grammar_preserves_both_tree_shapes() {
     "#;
 
     for target in ["$left", "$right"] {
-        let mut monitor = LivePrefixMonitor::from_egglog(&grammar, egraph, target).unwrap();
-        assert!(!monitor.intersection_is_empty());
-        assert!(!monitor.push_token_name("A", "a").unwrap());
-        assert!(!monitor.push_token_name("A", "a").unwrap());
-        assert!(!monitor.push_token_name("A", "a").unwrap());
+        let mut monitor = Monitor::new(&grammar, egraph, target).unwrap();
+        assert_eq!(monitor.realizability(), Some(true));
+        assert_eq!(monitor.push_token_name("A", "a").unwrap(), Some(true));
+        assert_eq!(monitor.push_token_name("A", "a").unwrap(), Some(true));
+        assert_eq!(monitor.push_token_name("A", "a").unwrap(), Some(true));
     }
 }
 
@@ -109,7 +115,7 @@ fn project_unit_cycle_terminates_and_preserves_the_leaf_value() {
         "#,
     )
     .unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(
+    let mut monitor = Monitor::new(
         &grammar,
         r#"
         (datatype Ast (Leaf))
@@ -119,7 +125,7 @@ fn project_unit_cycle_terminates_and_preserves_the_leaf_value() {
     )
     .unwrap();
 
-    assert!(!monitor.intersection_is_empty());
-    assert!(!monitor.push_token_name("A", "a").unwrap());
-    assert!(monitor.push_token_name("A", "a").unwrap());
+    assert_eq!(monitor.realizability(), Some(true));
+    assert_eq!(monitor.push_token_name("A", "a").unwrap(), Some(true));
+    assert_eq!(monitor.push_token_name("A", "a").unwrap(), Some(false));
 }

@@ -1,13 +1,11 @@
 use thiserror::Error;
 
-use crate::{grammar::GrammarError, pwz::PwzError};
+use crate::grammar::GrammarError;
 
 #[derive(Debug, Error)]
-pub enum LiveMonitorError {
+pub enum MonitorError {
     #[error(transparent)]
     Grammar(#[from] GrammarError),
-    #[error(transparent)]
-    Pwz(#[from] PwzError),
     #[error("egglog update failed: {0}")]
     Egglog(String),
     #[error("unknown disjointness relation `{0}`")]
@@ -50,14 +48,4 @@ pub enum LiveMonitorError {
     NonMonotoneUpdate(String),
     #[error("the live monitor does not execute operational egglog command `{0}`")]
     UnsupportedUpdateCommand(String),
-    #[error("egglog update refers to reserved monitor namespace `{0}`")]
-    ReservedNamespace(String),
-    #[error("managed saturation accepts only rewrite and birewrite commands; found `{0}`")]
-    UnsupportedManagedSaturationCommand(String),
-    #[error("managed rewrite has no equality-sorted root tracked by the monitor")]
-    UnsupportedManagedRewrite,
-    #[error(
-        "managed equality saturation did not reach a fixed point within {rounds} joint round(s); the e-graph and monitor contain the sound partial result and saturation can be resumed"
-    )]
-    ManagedSaturationRoundLimit { rounds: usize },
 }

@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use prefixspace::{Grammar, LivePrefixMonitor};
+use prefixspace::{Grammar, Monitor};
 
 fn deep_right_recursive_fixture(depth: usize) -> (Grammar, String) {
     let mut yacc = String::from("%start n0\n%token X\n%%\n");
@@ -31,31 +31,26 @@ fn late_leaf_union_propagates_through_a_300_layer_realizability_chain() {
     const DEPTH: usize = 300;
     let (grammar, egglog) = deep_right_recursive_fixture(DEPTH);
     let terminal = grammar.terminal_by_name("X").unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(&grammar, &egglog, "$root").unwrap();
+    let mut monitor = Monitor::new(&grammar, &egglog, "$root").unwrap();
 
     // The only syntactic tree ends in Actual, while the target chain ends in
     // Expected. Keep a substantial parser history before changing the egraph.
-    assert!(monitor.intersection_is_empty());
+    assert_eq!(monitor.realizability(), None);
     for _ in 0..=DEPTH / 2 {
-        assert!(monitor.push_lexeme(terminal, "x").unwrap());
+        assert_eq!(monitor.push_lexeme(terminal, "x").unwrap(), None);
     }
-    let before = monitor.stats();
 
     // The prefix is unchanged. One leaf merge must propagate through all 300
-    // retained constructor levels without rebuilding or replaying it.
-    assert!(!monitor.run_egglog("(union $expected (Actual))").unwrap());
-    let after = monitor.stats();
-    assert_eq!(after.full_rebuilds, 0);
-    assert_eq!(after.lexeme_updates, before.lexeme_updates);
-    assert!(after.realizability_facts > before.realizability_facts);
-
+    // retained constructor levels without replaying it.
+    assert_eq!(
+        monitor.run_egglog("(union $expected (Actual))").unwrap(),
+        Some(true)
+    );
     for _ in (DEPTH / 2 + 1)..=DEPTH {
-        assert!(!monitor.push_lexeme(terminal, "x").unwrap());
+        assert_eq!(monitor.push_lexeme(terminal, "x").unwrap(), Some(true));
     }
-    assert!(!monitor.intersection_is_empty());
+    assert_eq!(monitor.realizability(), Some(true));
 
-    // One extra token is syntactically irreparable and remains so even if the
-    // egraph grows again.
-    assert!(monitor.push_lexeme(terminal, "x").unwrap());
-    assert!(monitor.run_egglog("(run 1)").unwrap());
+    // One extra token is syntactically irreparable.
+    assert_eq!(monitor.push_lexeme(terminal, "x").unwrap(), Some(false));
 }

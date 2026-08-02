@@ -1,7 +1,10 @@
 use std::{hint::black_box, time::Duration};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use prefixspace::{Grammar, LivePrefixMonitor, PwzRecognizer};
+use prefixspace::{
+    Grammar, Monitor,
+    paper_pwz::{Grammar as PwzGrammar, Pwz, Token as PwzToken},
+};
 
 fn list_grammar() -> Grammar {
     Grammar::from_yacc(
@@ -39,6 +42,7 @@ const UNMATCHED_EGRAPH: &str = r#"
 fn live_streaming(c: &mut Criterion) {
     let grammar = list_grammar();
     let terminal = grammar.terminal_by_name("X").unwrap();
+    let pwz_grammar: PwzGrammar<()> = (&grammar).try_into().unwrap();
     let mut group = c.benchmark_group("live_ll1_stream");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
@@ -55,10 +59,14 @@ fn live_streaming(c: &mut Criterion) {
             &count,
             |b, &count| {
                 b.iter_batched_ref(
-                    || PwzRecognizer::compile(&grammar).unwrap(),
+                    || Pwz::new(pwz_grammar.clone()),
                     |parser| {
                         for _ in 0..count {
-                            black_box(parser.push(terminal).unwrap());
+                            parser.derive(PwzToken {
+                                terminal: terminal.index() as u32,
+                                payload: (),
+                            });
+                            black_box(parser.zippers());
                         }
                     },
                     BatchSize::PerIteration,
@@ -70,7 +78,7 @@ fn live_streaming(c: &mut Criterion) {
             &count,
             |b, &count| {
                 b.iter_batched_ref(
-                    || LivePrefixMonitor::from_egglog(&grammar, UNMATCHED_EGRAPH, "$root").unwrap(),
+                    || Monitor::new(&grammar, UNMATCHED_EGRAPH, "$root").unwrap(),
                     |monitor| {
                         for _ in 0..count {
                             black_box(monitor.push_lexeme(terminal, "x").unwrap());
@@ -82,7 +90,7 @@ fn live_streaming(c: &mut Criterion) {
         );
         group.bench_with_input(BenchmarkId::new("live", count), &count, |b, &count| {
             b.iter_batched_ref(
-                || LivePrefixMonitor::from_egglog(&grammar, LIST_EGRAPH, "$root").unwrap(),
+                || Monitor::new(&grammar, LIST_EGRAPH, "$root").unwrap(),
                 |monitor| {
                     for _ in 0..count {
                         black_box(monitor.push_lexeme(terminal, "x").unwrap());
@@ -99,9 +107,9 @@ fn live_deltas(c: &mut Criterion) {
     let grammar = list_grammar();
     let terminal = grammar.terminal_by_name("X").unwrap();
     let setup = |count| {
-        let mut monitor = LivePrefixMonitor::from_egglog(&grammar, LIST_EGRAPH, "$root").unwrap();
+        let mut monitor = Monitor::new(&grammar, LIST_EGRAPH, "$root").unwrap();
         for _ in 0..count {
-            assert!(!monitor.push_lexeme(terminal, "x").unwrap());
+            assert_eq!(monitor.push_lexeme(terminal, "x").unwrap(), Some(true));
         }
         monitor
     };
@@ -114,7 +122,7 @@ fn live_deltas(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("no_op_run", count), &count, |b, &count| {
             b.iter_batched_ref(
                 || setup(count),
-                |monitor| black_box(monitor.run_egglog("(run 1)").unwrap()),
+                |monitor| black_box(monitor.run_egglog("(union $nil $nil)").unwrap()),
                 BatchSize::PerIteration,
             )
         });
@@ -150,7 +158,7 @@ fn live_deltas(c: &mut Criterion) {
     group.bench_function("relevant_union", |b| {
         b.iter_batched_ref(
             || {
-                let mut monitor = LivePrefixMonitor::from_egglog(
+                let mut monitor = Monitor::new(
                     &relevant_grammar,
                     r#"
                     (datatype Ast (Good) (Bad))
@@ -160,7 +168,7 @@ fn live_deltas(c: &mut Criterion) {
                     "$root",
                 )
                 .unwrap();
-                assert!(monitor.push_lexeme(bad, "bad").unwrap());
+                assert_ne!(monitor.push_lexeme(bad, "bad").unwrap(), Some(true));
                 monitor
             },
             |monitor| black_box(monitor.run_egglog("(union $root $bad)").unwrap()),
@@ -170,116 +178,5 @@ fn live_deltas(c: &mut Criterion) {
     group.finish();
 }
 
-fn managed_saturation(c: &mut Criterion) {
-    let leaf_grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token BAD
-        %%
-        start: BAD { Bad() };
-        "#,
-    )
-    .unwrap();
-    let bad = leaf_grammar.terminal_by_name("BAD").unwrap();
-    let setup_leaf = || {
-        let mut monitor = LivePrefixMonitor::from_egglog(
-            &leaf_grammar,
-            "(datatype Ast (Good) (Bad)) (let $root (Good))",
-            "$root",
-        )
-        .unwrap();
-        assert!(monitor.push_lexeme(bad, "bad").unwrap());
-        monitor
-    };
-
-    let mut group = c.benchmark_group("managed_saturation");
-    group.sample_size(10);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(5));
-    group.bench_function("target_basin_birewrite", |b| {
-        b.iter_batched_ref(
-            setup_leaf,
-            |monitor| {
-                black_box(
-                    monitor
-                        .add_managed_rewrites("(birewrite (Bad) (Good))")
-                        .unwrap(),
-                )
-            },
-            BatchSize::PerIteration,
-        )
-    });
-
-    // The unrelated rows deliberately dwarf the target basin. A pure
-    // birewrite should install and close without scanning these matches.
-    let mut unrelated_program =
-        String::from("(datatype Ast (Good) (Bad) (Junk i64) (Other i64))\n");
-    unrelated_program.push_str("(let $root (Good))\n");
-    for value in 0..1_024 {
-        unrelated_program.push_str(&format!("(let $junk_{value} (Junk {value}))\n"));
-    }
-    group.bench_function("target_basin_skips_1024_unrelated_rows", |b| {
-        b.iter_batched_ref(
-            || {
-                let mut monitor =
-                    LivePrefixMonitor::from_egglog(&leaf_grammar, &unrelated_program, "$root")
-                        .unwrap();
-                assert!(monitor.push_lexeme(bad, "bad").unwrap());
-                monitor
-            },
-            |monitor| {
-                black_box(
-                    monitor
-                        .add_managed_rewrites("(birewrite (Junk x) (Other x))")
-                        .unwrap(),
-                )
-            },
-            BatchSize::PerIteration,
-        )
-    });
-
-    let common_ancestor_grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token LEAF
-        %%
-        start: LEAF { Leaf() };
-        "#,
-    )
-    .unwrap();
-    let leaf = common_ancestor_grammar.terminal_by_name("LEAF").unwrap();
-    group.bench_function("directed_unrelated_lhs_is_skipped", |b| {
-        b.iter_batched_ref(
-            || {
-                let mut monitor = LivePrefixMonitor::from_egglog(
-                    &common_ancestor_grammar,
-                    r#"
-                    (datatype Ast (Good) (Leaf) (U) (Middle))
-                    (let $root (Good))
-                    (let $source (U))
-                    "#,
-                    "$root",
-                )
-                .unwrap();
-                assert!(monitor.push_lexeme(leaf, "leaf").unwrap());
-                monitor
-            },
-            |monitor| {
-                black_box(
-                    monitor
-                        .add_managed_rewrites(
-                            "(rewrite (U) (Middle))\n\
-                             (rewrite (Middle) (Good))\n\
-                             (rewrite (Middle) (Leaf))",
-                        )
-                        .unwrap(),
-                )
-            },
-            BatchSize::PerIteration,
-        )
-    });
-    group.finish();
-}
-
-criterion_group!(benches, live_streaming, live_deltas, managed_saturation);
+criterion_group!(benches, live_streaming, live_deltas);
 criterion_main!(benches);

@@ -1,6 +1,3 @@
-use prefixspace::{
-    DEFAULT_PREFIX_FOCUS_WORK_LIMIT, DEFAULT_UNREALIZABILITY_WORK_LIMIT, Grammar, LivePrefixMonitor,
-};
 use prefixspace_web::{
     DEFAULT_EGGLOG_PROGRAM, RealizabilityState, TYPESCRIPT_YACC, TypeScriptAnalyzer,
 };
@@ -22,9 +19,12 @@ const NO_TYPING_RULES: &str = r#"
   (Modulo Expr Expr)
   (LessThan Expr Expr)
   (Property Expr String)
+  (Identifier String)
+  (Call Expr Expr)
   (NumberExpression)
   (StringExpression)
   (BooleanExpression)
+  (NumberFunctionExpression)
   (ExpressionError))
 (datatype Annotation
   (NumberAnnotation)
@@ -36,8 +36,8 @@ const NO_TYPING_RULES: &str = r#"
   (Analyze Declaration)
   (Accept)
   (Reject))
-(relation GoalDisjoint (Goal Goal))
-(GoalDisjoint (Reject) (Accept))
+(relation Disjoint (Goal Goal))
+(Disjoint (Reject) (Accept))
 (let $required (Accept))
 "#;
 
@@ -56,6 +56,8 @@ fn grammar_builds_syntax_and_the_program_visibly_contains_typing_rules() {
         "NumberLiteral()",
         "Add(1, 3)",
         "Property(1, 3)",
+        "Identifier(1)",
+        "Call(1, 3)",
     ] {
         assert!(
             TYPESCRIPT_YACC.contains(constructor),
@@ -110,6 +112,10 @@ fn operators_are_typed_compositionally() {
         "let answer: number = \"hello\".length;",
         "let length: number = 1;",
         "let answer: number = 20 - 3 * 4 / 2 % 5;",
+        "let answer: number = Number(0);",
+        "let answer: number = Number(Number(0));",
+        "let answer: number = Number(\"42\");",
+        "let answer: number = Number(true);",
     ] {
         assert_eq!(
             analyze(source).realizability,
@@ -190,28 +196,26 @@ fn syntax_failure_is_still_definitive_without_typing_rules() {
 }
 
 #[test]
-fn ordinary_typescript_tokens_do_not_hit_emergency_zipper_budgets() {
-    let grammar = Grammar::from_yacc_lex(TYPESCRIPT_YACC, prefixspace_web::TYPESCRIPT_LEX).unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_local_saturation_and_disjointness(
-        &grammar,
-        DEFAULT_EGGLOG_PROGRAM,
-        "$required",
-        "GoalDisjoint",
-    )
-    .unwrap();
-
-    for token in grammar.lex("let answer: number = 5 + true;").unwrap() {
-        monitor.push_token(&token).unwrap();
-        let stats = monitor.stats();
-        assert!(
-            stats.last_prefix_focus_work < DEFAULT_PREFIX_FOCUS_WORK_LIMIT,
-            "focus exhausted its emergency budget after {:?}: {stats:?}",
-            token.lexeme
-        );
-        assert!(
-            stats.last_prefix_output_work < DEFAULT_UNREALIZABILITY_WORK_LIMIT,
-            "negative checking exhausted its emergency budget after {:?}: {stats:?}",
-            token.lexeme
-        );
+fn thousands_of_nested_number_calls_remain_realizable_at_every_complete_lexeme() {
+    let depth = 4_096;
+    let mut source = String::from("let answer: number = ");
+    for _ in 0..depth {
+        source.push_str("Number(");
     }
+    source.push('0');
+    for _ in 0..depth {
+        source.push(')');
+    }
+    source.push(';');
+
+    let report = analyze(&source);
+    assert_eq!(report.tokens.len(), 3 * depth + 7);
+    assert_eq!(report.realizability, RealizabilityState::Realizable);
+    assert!(
+        report
+            .tokens
+            .iter()
+            .all(|token| token.realizability == RealizabilityState::Realizable),
+        "every recorded prefix ends at a complete lexer token"
+    );
 }

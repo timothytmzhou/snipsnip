@@ -1,47 +1,40 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
+};
+
+use egglog::{
+    ArcSort, EGraph, RawValues, Read, Value, Write,
+    ast::{Action as EggAction, Change, Command, Expr, ResolvedCommand},
+    scheduler::{Matches, Scheduler, SchedulerId},
+    sort::S,
+    util::FreshGen,
 };
 
 use crate::{
-    error::LiveMonitorError,
+    error::MonitorError,
     grammar::{Action, Grammar, RuntimeInput, Symbol, TerminalId},
     realizability::{
-        ConstructorId, ConstructorSchema, EGraphChange, EGraphView, EGraphWriter,
-        Enode as CoreEnode, SortId, TypedClass,
+        Application as CoreApplication, ConstructorId, ConstructorSchema, EGraphChange, SortId,
+        TypedClass,
     },
-};
-use egglog::{
-    ArcSort, EGraph, ExecutionState, Primitive, Value,
-    ast::{
-        Action as EggAction, Change, Command, Expr, Fact, GenericActions, Literal, Rewrite, Rule,
-        Subdatatypes,
-    },
-    constraint::{SimpleTypeConstraint, TypeConstraint},
-    prelude::{BaseSort, I64Sort, RustSpan, Span, UnitSort},
-    sort::S,
 };
 
-/// Opaque identity of one backend value.  Other modules may store and compare
-/// it, but only this module can inspect or canonicalize the egglog value.
+/// An Egglog value is meaningful only together with the sort recorded by
+/// `TypedClass`. Keeping the raw value opaque prevents the parser side from
+/// depending on Egglog's representation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ValueId(Value);
 
 impl ValueId {
-    #[inline]
-    fn from_egglog(value: Value) -> Self {
-        Self(value)
-    }
-
-    #[inline]
-    fn into_egglog(self) -> Value {
+    fn raw(self) -> Value {
         self.0
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct BackendSchema {
-    pub(crate) constructors: Vec<ConstructorSchema>,
+    pub(crate) constructors: Arc<[ConstructorSchema]>,
     constructor_ids: HashMap<String, ConstructorId>,
 }
 
@@ -60,19 +53,16 @@ pub(crate) struct ExactToken {
 #[derive(Clone, Debug)]
 pub(crate) struct BackendDelta {
     pub(crate) changes: Vec<EGraphChange>,
-    pub(crate) saturation: SaturationRun,
 }
 
 pub(crate) struct BackendInit {
     pub(crate) backend: EgglogBackend,
     pub(crate) schema: BackendSchema,
-    pub(crate) delta: BackendDelta,
-    pub(crate) initial_managed_rewrites: usize,
 }
 
 pub(crate) enum MutationResult {
     Applied,
-    PartiallyApplied(LiveMonitorError),
+    PartiallyApplied(MonitorError),
 }
 
 #[derive(Clone, Copy)]
@@ -93,384 +83,183 @@ impl PrimitiveKind {
 
 #[derive(Clone)]
 struct SortSpec {
-    id: SortId,
     name: String,
-    reach: Option<String>,
-    domain: Option<String>,
-    capture_domain: Option<String>,
+    sort: ArcSort,
     primitive: Option<PrimitiveKind>,
 }
 
 #[derive(Clone)]
 struct ConstructorSpec {
-    id: ConstructorId,
     name: String,
-    capture: String,
-    inputs: Vec<String>,
-    output: String,
 }
 
-#[derive(Clone, Debug)]
-enum CapturedFact {
-    Enode {
-        constructor: ConstructorId,
-        output: Value,
-        children: Vec<Value>,
-    },
-    Domain {
-        sort: SortId,
-        value: Value,
-        lexical_form: String,
-        integer: Option<i64>,
-    },
-}
-
-type CaptureBuffer = Arc<Mutex<Vec<CapturedFact>>>;
-
-#[derive(Clone)]
-struct CaptureEnode {
+struct ValidatedConstructor {
     name: String,
-    sorts: Vec<ArcSort>,
-    constructor: ConstructorId,
-    buffer: CaptureBuffer,
+    schema: ConstructorSchema,
 }
 
-impl Primitive for CaptureEnode {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn get_type_constraints(&self, span: &egglog::ast::Span) -> Box<dyn TypeConstraint> {
-        let mut sorts = self.sorts.clone();
-        sorts.push(UnitSort.to_arcsort());
-        SimpleTypeConstraint::new(self.name(), sorts, span.clone()).into_box()
-    }
-
-    fn apply(&self, state: &mut ExecutionState<'_>, arguments: &[Value]) -> Option<Value> {
-        let (&output, children) = arguments.split_first()?;
-        self.buffer.lock().unwrap().push(CapturedFact::Enode {
-            constructor: self.constructor,
-            output,
-            children: children.to_vec(),
-        });
-        Some(state.base_values().get::<()>(()))
-    }
-}
-
-#[derive(Clone)]
-struct CaptureDomain {
-    name: String,
-    sort: ArcSort,
-    sort_id: SortId,
-    kind: PrimitiveKind,
-    buffer: CaptureBuffer,
-}
-
-impl Primitive for CaptureDomain {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn get_type_constraints(&self, span: &egglog::ast::Span) -> Box<dyn TypeConstraint> {
-        SimpleTypeConstraint::new(
-            self.name(),
-            vec![self.sort.clone(), UnitSort.to_arcsort()],
-            span.clone(),
-        )
-        .into_box()
-    }
-
-    fn apply(&self, state: &mut ExecutionState<'_>, arguments: &[Value]) -> Option<Value> {
-        let (lexical_form, integer) = match self.kind {
-            PrimitiveKind::String => (
-                state
-                    .base_values()
-                    .unwrap::<S>(arguments[0])
-                    .as_str()
-                    .to_owned(),
-                None,
-            ),
-            PrimitiveKind::I64 => {
-                let value = state.base_values().unwrap::<i64>(arguments[0]);
-                (value.to_string(), Some(value))
-            }
-        };
-        self.buffer.lock().unwrap().push(CapturedFact::Domain {
-            sort: self.sort_id,
-            value: arguments[0],
-            lexical_form,
-            integer,
-        });
-        Some(state.base_values().get::<()>(()))
-    }
-}
-
-#[derive(Clone)]
-struct RecallValue {
-    name: String,
-    sort: ArcSort,
-    values: Arc<Mutex<Vec<Value>>>,
-}
-
-impl Primitive for RecallValue {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn get_type_constraints(&self, span: &egglog::ast::Span) -> Box<dyn TypeConstraint> {
-        SimpleTypeConstraint::new(
-            self.name(),
-            vec![I64Sort.to_arcsort(), self.sort.clone()],
-            span.clone(),
-        )
-        .into_box()
-    }
-
-    fn apply(&self, state: &mut ExecutionState<'_>, arguments: &[Value]) -> Option<Value> {
-        let index = state.base_values().unwrap::<i64>(arguments[0]);
-        usize::try_from(index)
-            .ok()
-            .and_then(|index| self.values.lock().unwrap().get(index).copied())
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct TokenSortSpec {
-    sort: String,
+    sort: SortId,
     kind: PrimitiveKind,
 }
 
-struct MatcherNames {
-    ruleset: String,
-    saturation_ruleset: String,
-    relevant_ruleset: String,
-    targets: String,
-    sorts: BTreeMap<String, SortSpec>,
-    saturation_reach: BTreeMap<String, String>,
-    saturation_initialized: bool,
-    projected_functions: BTreeSet<String>,
-    /// User-declared functions which may occur as congruence contexts.
-    /// Managed target-basin demand must descend through all of them, not
-    /// merely the constructors mentioned by the grammar or by a rewrite.
-    known_functions: BTreeSet<String>,
-    installed_rewrite_directions: BTreeSet<String>,
-    constructors: HashMap<String, ConstructorSpec>,
-    token_sorts: Vec<Vec<TokenSortSpec>>,
-}
-
-struct TargetValue {
-    sort: ArcSort,
-    sort_id: SortId,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FocusValue {
+    sort: String,
     value: Value,
 }
 
-struct CapturedView {
-    targets: Vec<TypedClass<ValueId>>,
-    enodes: Vec<Vec<CoreEnode<ValueId>>>,
-    enode_seen: Vec<HashSet<CoreEnode<ValueId>>>,
-    terminals: Vec<Vec<TypedClass<ValueId>>>,
-    terminal_seen: Vec<HashSet<TypedClass<ValueId>>>,
+#[derive(Default)]
+struct ScheduleState {
+    focus: HashSet<FocusValue>,
+    roots: HashMap<String, MatchRoot>,
+    anchors: HashMap<String, Vec<String>>,
+    active: HashSet<String>,
 }
 
-struct ValueRecall {
-    values: Arc<Mutex<Vec<Value>>>,
-    names: Vec<String>,
+#[derive(Clone)]
+struct MatchRoot {
+    variable: String,
+    sort: String,
 }
 
-/// Owns the egglog instance and every piece of state whose meaning depends on
-/// egglog's values, schemas, commands, or scheduler.
+/// Egglog computes the matches. This scheduler only decides which already
+/// computed matches belong to the part of the e-graph exposed by the current
+/// zippers. Matches rejected now remain in Egglog's scheduler worklist and can
+/// be selected after a later derivative grows `focus`.
+#[derive(Clone)]
+struct FocusScheduler {
+    state: Arc<RwLock<ScheduleState>>,
+}
+
+impl Scheduler for FocusScheduler {
+    fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
+        let state = self.state.read().unwrap();
+        if let Some(root) = state.roots.get(rule) {
+            if state.active.contains(rule) {
+                matches.choose_all();
+                return true;
+            }
+            for index in 0..matches.match_size() {
+                let value = matches.get_match(index).get_value(&root.variable);
+                if state.focus.contains(&FocusValue {
+                    sort: root.sort.clone(),
+                    value,
+                }) {
+                    matches.choose(index);
+                }
+            }
+            return true;
+        }
+        // Egglog's public Scheduler API does not expose the final variables
+        // introduced while compiling an ordinary rule. Global execution is
+        // therefore the sound fallback for non-rewrite rules.
+        matches.choose_all();
+        true
+    }
+}
+
+struct TargetValue {
+    expression: Expr,
+    sort: ArcSort,
+    sort_id: SortId,
+    value: ValueId,
+}
+
+/// The only semantic database is `egraph`. The remaining fields are immutable
+/// schema, scheduler metadata, parser-derived relevant class IDs, and pending
+/// change notifications. Constructor rows and lexical domains are read
+/// directly from Egglog and are never mirrored here.
 pub(crate) struct EgglogBackend {
     egraph: EGraph,
-    input: RuntimeInput,
-    names: MatcherNames,
-    private_prefix: String,
-    captures: CaptureBuffer,
+    input: Arc<RuntimeInput>,
+    sorts: Vec<SortSpec>,
+    constructors: Vec<ConstructorSpec>,
+    constructor_schemas: Arc<[ConstructorSchema]>,
+    token_sorts: Vec<Vec<TokenSortSpec>>,
     target: TargetValue,
-    constructor_names: Vec<String>,
-    sort_metadata: Vec<(String, ArcSort)>,
-    relevance_marked_values: HashSet<(SortId, Value)>,
-    constructor_schemas: Vec<ConstructorSchema>,
-    view: CapturedView,
-    recall: ValueRecall,
+    schedule: Arc<RwLock<ScheduleState>>,
+    scheduler: SchedulerId,
+    rulesets: Vec<String>,
+    rule_roots: HashMap<String, Vec<Option<String>>>,
+    pending: Vec<EGraphChange>,
 }
 
 impl EgglogBackend {
     pub(crate) fn initialize(
         grammar: &Grammar,
-        input: &RuntimeInput,
+        input: Arc<RuntimeInput>,
         program: &str,
         target_binding: &str,
-        locally_saturate_initial_rewrites: bool,
-        initial_round_limit: usize,
-    ) -> Result<BackendInit, LiveMonitorError> {
+    ) -> Result<BackendInit, MonitorError> {
         let mut egraph = EGraph::default();
-        let prefix = choose_prefix(&egraph, program);
-        let initial_commands = egraph
-            .parser
-            .get_program_from_string(None, program)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        reject_nonmonotone_commands(&initial_commands)?;
-        let (initial_rewrites, setup_commands) = if locally_saturate_initial_rewrites {
-            let mut rewrites = Vec::new();
-            let mut setup = Vec::new();
-            for command in initial_commands {
-                match command {
-                    Command::Rewrite(..) | Command::BiRewrite(..) => rewrites.push(command),
-                    Command::RunSchedule(..) => {
-                        return Err(LiveMonitorError::UnsupportedUpdateCommand(
-                            "run-schedule".to_owned(),
-                        ));
-                    }
-                    _ => setup.push(command),
-                }
-            }
-            (rewrites, setup)
-        } else {
-            (Vec::new(), initial_commands)
-        };
-        let declared_constructors = collect_declared_constructors(&setup_commands);
-        let declared_functions = collect_declared_functions(&setup_commands);
-        egraph
-            .run_program(setup_commands)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
+        let commands = egraph.parse_program(None, program).map_err(egglog_error)?;
+        reject_nonmonotone_commands(&commands)?;
+        let commands = without_schedules(commands);
+        let rules = run_commands(&mut egraph, commands)?;
 
-        let binding_source = normalize_binding(target_binding)?;
-        let binding_expression = egraph
-            .parser
-            .get_expr_from_string(None, &binding_source)
-            .map_err(|error| LiveMonitorError::InvalidBinding {
-                binding: target_binding.to_owned(),
-                reason: error.to_string(),
-            })?;
-        if !matches!(binding_expression, Expr::Var(_, _)) {
-            return Err(LiveMonitorError::InvalidBinding {
-                binding: target_binding.to_owned(),
-                reason: "expected one global name".to_owned(),
-            });
-        }
+        let target_expression = binding_expression(&mut egraph, target_binding)?;
         let (target_sort, target_value) =
-            egraph.eval_expr(&binding_expression).map_err(|error| {
-                LiveMonitorError::InvalidBinding {
+            egraph
+                .eval_expr(&target_expression)
+                .map_err(|error| MonitorError::InvalidBinding {
                     binding: target_binding.to_owned(),
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
         if !target_sort.is_eq_sort() {
-            return Err(LiveMonitorError::NonEqualityTarget(
+            return Err(MonitorError::NonEqualityTarget(
                 target_sort.name().to_owned(),
             ));
         }
 
-        let names = build_specs(
-            grammar,
-            &egraph,
-            input,
-            &prefix,
-            target_sort.name(),
-            &declared_constructors,
-            declared_functions,
-        )?;
-        let captures = Arc::new(Mutex::new(Vec::new()));
-        register_capture_primitives(&mut egraph, &names, captures.clone());
-        let rules = build_matcher_program(&names, target_sort.name());
-        egraph
-            .parse_and_run_program(None, &rules)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        insert_target(&mut egraph, &names.targets, binding_expression.clone())?;
-
-        let target_sort_id = names.sorts[target_sort.name()].id;
-        let constructors = constructor_schemas(&names);
-        let constructor_ids = names
-            .constructors
+        let (sorts, constructors, constructor_ids, token_sorts) =
+            build_schema(grammar, &input, &egraph, &target_sort)?;
+        let target_sort_id = sorts
             .iter()
-            .map(|(name, spec)| (name.clone(), spec.id))
-            .collect();
+            .position(|sort| sort.name == target_sort.name())
+            .expect("target sort is part of the monitored schema");
+        let constructor_schemas: Arc<[ConstructorSchema]> = constructors
+            .iter()
+            .map(|constructor| constructor.schema.clone())
+            .collect::<Vec<_>>()
+            .into();
         let schema = BackendSchema {
-            constructors: constructors.clone(),
+            constructors: constructor_schemas.clone(),
             constructor_ids,
         };
 
-        let mut constructor_names = vec![String::new(); names.constructors.len()];
-        for constructor in names.constructors.values() {
-            constructor_names[constructor.id] = constructor.name.clone();
-        }
-        let mut sort_metadata = vec![None; names.sorts.len()];
-        for sort in names.sorts.values() {
-            let egglog_sort = egraph
-                .get_sort_by_name(&sort.name)
-                .expect("monitored sort still exists")
-                .clone();
-            sort_metadata[sort.id] = Some((sort.name.clone(), egglog_sort));
-        }
-        let sort_metadata: Vec<(String, ArcSort)> = sort_metadata
-            .into_iter()
-            .map(|sort| sort.expect("sort IDs are dense"))
-            .collect();
-        let recalled_values = Arc::new(Mutex::new(Vec::new()));
-        let recall_names = sort_metadata
-            .iter()
-            .enumerate()
-            .map(|(sort, (_, egglog_sort))| {
-                let name = format!("{prefix}_recall_{sort}");
-                egraph.add_primitive(RecallValue {
-                    name: name.clone(),
-                    sort: egglog_sort.clone(),
-                    values: recalled_values.clone(),
-                });
-                name
-            })
-            .collect();
-
+        let schedule = Arc::new(RwLock::new(ScheduleState::default()));
+        let scheduler = egraph.add_scheduler(Box::new(FocusScheduler {
+            state: schedule.clone(),
+        }));
         let mut backend = Self {
             egraph,
-            input: input.clone(),
-            names,
-            private_prefix: prefix,
-            captures,
+            input,
+            sorts,
+            constructors: constructors
+                .into_iter()
+                .map(|constructor| ConstructorSpec {
+                    name: constructor.name,
+                })
+                .collect(),
+            constructor_schemas,
+            token_sorts,
             target: TargetValue {
+                expression: target_expression,
                 sort: target_sort,
                 sort_id: target_sort_id,
-                value: target_value,
+                value: ValueId(target_value),
             },
-            constructor_names,
-            sort_metadata,
-            relevance_marked_values: HashSet::new(),
-            constructor_schemas: constructors.clone(),
-            view: CapturedView {
-                targets: Vec::new(),
-                enodes: vec![Vec::new(); constructors.len()],
-                enode_seen: vec![HashSet::new(); constructors.len()],
-                terminals: vec![Vec::new(); grammar.terminal_count()],
-                terminal_seen: vec![HashSet::new(); grammar.terminal_count()],
-            },
-            recall: ValueRecall {
-                values: recalled_values,
-                names: recall_names,
-            },
+            schedule,
+            scheduler,
+            rulesets: Vec::new(),
+            rule_roots: HashMap::new(),
+            pending: Vec::new(),
         };
-
-        let mut saturation = backend.saturate_matcher(usize::MAX)?;
-        debug_assert!(saturation.complete);
-        let mut initial_managed_rewrites = 0;
-        if !initial_rewrites.is_empty() {
-            initial_managed_rewrites = backend.install_managed_commands(initial_rewrites)?;
-            let managed = backend.saturate_matcher(initial_round_limit)?;
-            saturation.rounds = saturation.rounds.saturating_add(managed.rounds);
-            saturation.projection_matches = saturation
-                .projection_matches
-                .saturating_add(managed.projection_matches);
-            saturation.basin_matches = saturation
-                .basin_matches
-                .saturating_add(managed.basin_matches);
-            saturation.complete = managed.complete;
-        }
-        let delta = backend.take_delta(saturation);
-        Ok(BackendInit {
-            backend,
-            schema,
-            delta,
-            initial_managed_rewrites,
-        })
+        backend.install_rules(rules);
+        backend.begin_focus();
+        Ok(BackendInit { backend, schema })
     }
 
     pub(crate) fn exact_tokens(
@@ -478,915 +267,676 @@ impl EgglogBackend {
         terminal: TerminalId,
         lexeme: &str,
         output: &mut Vec<ExactToken>,
-    ) -> Result<(), LiveMonitorError> {
-        let Some(sorts) = self.names.token_sorts.get(terminal.index()) else {
-            return Err(LiveMonitorError::InvalidTerminalId(terminal.index()));
+    ) -> Result<(), MonitorError> {
+        let Some(sorts) = self.token_sorts.get(terminal.index()) else {
+            return Err(MonitorError::InvalidTerminalId(terminal.index()));
         };
         output.clear();
         for token in sorts {
-            let sort = self.names.sorts[&token.sort].id;
-            let exact = match token.kind {
-                PrimitiveKind::String => ExactToken {
-                    sort,
-                    value: ValueId::from_egglog(
-                        self.egraph.base_to_value::<S>(lexeme.to_owned().into()),
-                    ),
-                },
+            let value = match token.kind {
+                PrimitiveKind::String => self.egraph.base_to_value::<S>(lexeme.to_owned().into()),
                 PrimitiveKind::I64 => {
-                    let Ok(integer) = lexeme.parse() else {
+                    let Ok(value) = lexeme.parse::<i64>() else {
                         continue;
                     };
-                    ExactToken {
-                        sort,
-                        value: ValueId::from_egglog(self.egraph.base_to_value::<i64>(integer)),
-                    }
+                    self.egraph.base_to_value(value)
                 }
             };
-            output.push(exact);
+            output.push(ExactToken {
+                sort: token.sort,
+                value: ValueId(value),
+            });
         }
         Ok(())
     }
 
     pub(crate) fn terminal_count(&self) -> usize {
-        self.names.token_sorts.len()
+        self.token_sorts.len()
     }
 
-    pub(crate) fn saturate_local(
+    pub(crate) fn target(&self) -> TypedClass<ValueId> {
+        TypedClass {
+            sort: self.target.sort_id,
+            class: self.target.value,
+        }
+    }
+
+    /// Visits the current Egglog rows for one grammar constructor. No row is
+    /// retained after this call.
+    pub(crate) fn for_each_application(
+        &self,
+        constructor: ConstructorId,
+        mut visit: impl FnMut(CoreApplication<ValueId>),
+    ) {
+        let spec = &self.constructors[constructor];
+        let schema = &self.constructor_schemas[constructor];
+        self.egraph
+            .constructor_enodes(&spec.name, |enode| {
+                if enode.subsumed {
+                    return;
+                }
+                let output_sort = &self.sorts[schema.output].sort;
+                let output = ValueId(self.canonical(output_sort, enode.eclass));
+                let children = enode
+                    .children
+                    .iter()
+                    .zip(&schema.inputs)
+                    .map(|(&value, &sort)| ValueId(self.canonical(&self.sorts[sort].sort, value)))
+                    .collect();
+                visit(CoreApplication { output, children });
+            })
+            .expect("grammar actions were validated as constructors");
+    }
+
+    /// Visits the primitive values which occur in current grammar-constructor
+    /// rows and are complete lexemes of `terminal`.
+    pub(crate) fn for_each_terminal_value(
+        &self,
+        terminal: u32,
+        mut visit: impl FnMut(TypedClass<ValueId>),
+    ) {
+        let Some(token_sorts) = self.token_sorts.get(terminal as usize) else {
+            return;
+        };
+        let terminal_id = TerminalId(terminal as usize);
+        let mut seen = HashSet::new();
+        for (constructor, schema) in self.constructors.iter().zip(&*self.constructor_schemas) {
+            self.egraph
+                .constructor_enodes(&constructor.name, |enode| {
+                    if enode.subsumed {
+                        return;
+                    }
+                    for (&value, &child_sort) in enode.children.iter().zip(&schema.inputs) {
+                        for token_sort in token_sorts {
+                            if token_sort.sort != child_sort {
+                                continue;
+                            }
+                            let matches = match token_sort.kind {
+                                PrimitiveKind::String => {
+                                    let string = self.egraph.value_to_base::<S>(value);
+                                    self.input.lexeme_matches(terminal_id, string.as_str())
+                                }
+                                PrimitiveKind::I64 => self.input.i64_lexeme_matches(
+                                    terminal_id,
+                                    self.egraph.value_to_base::<i64>(value),
+                                ),
+                            };
+                            let value = TypedClass {
+                                sort: child_sort,
+                                class: ValueId(value),
+                            };
+                            if matches && seen.insert(value) {
+                                visit(value);
+                            }
+                        }
+                    }
+                })
+                .expect("grammar actions were validated as constructors");
+        }
+    }
+
+    pub(crate) fn equivalent(&self, left: TypedClass<ValueId>, right: TypedClass<ValueId>) -> bool {
+        left.sort == right.sort
+            && self.canonical(&self.sorts[left.sort].sort, left.class.raw())
+                == self.canonical(&self.sorts[right.sort].sort, right.class.raw())
+    }
+
+    pub(crate) fn add_application(
         &mut self,
-        round_limit: usize,
-    ) -> Result<BackendDelta, LiveMonitorError> {
-        let saturation = self.saturate_matcher(round_limit)?;
-        Ok(self.take_delta(saturation))
+        constructor: ConstructorId,
+        children: &[TypedClass<ValueId>],
+    ) -> Result<TypedClass<ValueId>, MonitorError> {
+        let schema = &self.constructor_schemas[constructor];
+        let output_sort_id = schema.output;
+        debug_assert_eq!(children.len(), schema.inputs.len());
+        let name = self.constructors[constructor].name.clone();
+        let raw = children
+            .iter()
+            .map(|child| child.class.raw())
+            .collect::<Vec<_>>();
+        if let Some(value) = self
+            .egraph
+            .read(|state| state.eclass_of(&name, RawValues(raw.clone())))
+            .map_err(egglog_error)?
+        {
+            return Ok(TypedClass {
+                sort: output_sort_id,
+                class: ValueId(self.canonical(&self.sorts[output_sort_id].sort, value)),
+            });
+        }
+        let value = self
+            .egraph
+            .update(|mut state| state.add(&name, RawValues(raw)))
+            .map_err(egglog_error)?;
+        self.mark_constructor(constructor);
+        for terminal in 0..self.token_sorts.len() {
+            self.mark(EGraphChange::Terminal(terminal as u32));
+        }
+        Ok(TypedClass {
+            sort: output_sort_id,
+            class: ValueId(self.canonical(&self.sorts[output_sort_id].sort, value)),
+        })
+    }
+
+    /// Starts a synchronization with only the target class in focus.
+    pub(crate) fn begin_focus(&mut self) {
+        let sort = &self.sorts[self.target.sort_id];
+        let target = FocusValue {
+            sort: sort.name.clone(),
+            value: self.canonical(&sort.sort, self.target.value.raw()),
+        };
+        let mut schedule = self.schedule.write().unwrap();
+        schedule.focus.clear();
+        schedule.focus.insert(target);
+        drop(schedule);
+        self.close_focus_downward();
+    }
+
+    /// Adds parser-derived classes to the current focus and closes them
+    /// downward through grammar constructors. It never writes to Egglog.
+    pub(crate) fn saturate_near(
+        &mut self,
+        values: &[TypedClass<ValueId>],
+    ) -> Result<bool, MonitorError> {
+        let mut changed = false;
+        {
+            let mut schedule = self.schedule.write().unwrap();
+            for value in values {
+                let sort = &self.sorts[value.sort];
+                changed |= schedule.focus.insert(FocusValue {
+                    sort: sort.name.clone(),
+                    value: self.canonical(&sort.sort, value.class.raw()),
+                });
+            }
+        }
+        changed |= self.close_focus_downward();
+        Ok(changed)
+    }
+
+    /// Runs the current focused worklist to local quiescence. Skipped matches
+    /// remain in Egglog's scheduler and are reconsidered when `saturate_near`
+    /// adds another class.
+    pub(crate) fn saturate_local(&mut self) -> Result<BackendDelta, MonitorError> {
+        self.run_focused_rules()?;
+        self.flush_changes()
+    }
+
+    /// Drains structural changes which have already happened. This never runs
+    /// a user rule; the monitor uses it to close the existing intersection
+    /// before deciding whether more equality saturation is necessary.
+    pub(crate) fn flush_changes(&mut self) -> Result<BackendDelta, MonitorError> {
+        let (_, target) = self
+            .egraph
+            .eval_expr(&self.target.expression)
+            .map_err(egglog_error)?;
+        self.target.value = ValueId(self.canonical(&self.target.sort, target));
+        Ok(BackendDelta {
+            changes: std::mem::take(&mut self.pending),
+        })
     }
 
     pub(crate) fn apply_monotone_update(
         &mut self,
         update: &str,
-    ) -> Result<MutationResult, LiveMonitorError> {
+    ) -> Result<MutationResult, MonitorError> {
         let commands = self
             .egraph
-            .parser
-            .get_program_from_string(None, update)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        let declared_functions = collect_declared_functions(&commands);
-        if source_mentions_identifier_prefix(update, &self.private_prefix) {
-            return Err(LiveMonitorError::ReservedNamespace(
-                self.private_prefix.clone(),
-            ));
-        }
+            .parse_program(None, update)
+            .map_err(egglog_error)?;
         reject_nonmonotone_commands(&commands)?;
-        let update_result = self.egraph.run_program(commands);
-        let context_result = self.sync_context_functions(declared_functions);
-        match (update_result, context_result) {
-            (Ok(_), Ok(())) => Ok(MutationResult::Applied),
-            (Err(error), context) => {
-                let mut message = error.to_string();
-                if let Err(context) = context {
-                    message.push_str(&format!(
-                        "; additionally failed to install context projection: {context}"
-                    ));
-                }
-                Ok(MutationResult::PartiallyApplied(LiveMonitorError::Egglog(
-                    message,
-                )))
+        let commands = without_schedules(commands);
+        match run_commands(&mut self.egraph, commands) {
+            Ok(rules) => {
+                self.install_rules(rules);
+                self.recanonicalize_focus();
+                self.mark_all();
+                Ok(MutationResult::Applied)
             }
-            (Ok(_), Err(error)) => Ok(MutationResult::PartiallyApplied(error)),
+            Err(error) => {
+                // Egglog executes a batch in order, so earlier actions may have
+                // landed. Conservatively notify every monitored projection.
+                self.recanonicalize_focus();
+                self.mark_all();
+                Ok(MutationResult::PartiallyApplied(error))
+            }
         }
     }
 
-    pub(crate) fn install_managed_rewrites(
-        &mut self,
-        rewrites: &str,
-    ) -> Result<usize, LiveMonitorError> {
-        if source_mentions_identifier_prefix(rewrites, &self.private_prefix) {
-            return Err(LiveMonitorError::ReservedNamespace(
-                self.private_prefix.clone(),
-            ));
+    fn run_focused_rules(&mut self) -> Result<bool, MonitorError> {
+        if self.rulesets.is_empty() {
+            return Ok(false);
         }
-        let commands = self
+        let mut any_update = false;
+        loop {
+            self.close_focus_downward();
+            let mut updated = false;
+            for ruleset in self.rulesets.clone() {
+                let ruleset_updated = if self.ruleset_is_fully_focused(&ruleset) {
+                    let mut changed = false;
+                    loop {
+                        let report = self.egraph.step_rules(&ruleset).map_err(egglog_error)?;
+                        if !report.updated {
+                            break;
+                        }
+                        changed = true;
+                    }
+                    changed
+                } else {
+                    self.refresh_active_rules();
+                    let report = self
+                        .egraph
+                        .step_rules_with_scheduler(self.scheduler, &ruleset)
+                        .map_err(egglog_error)?;
+                    report.updated
+                };
+                updated |= ruleset_updated;
+            }
+            if !updated {
+                break;
+            }
+            any_update = true;
+            self.mark_all();
+            self.recanonicalize_focus();
+        }
+        Ok(any_update)
+    }
+
+    fn install_rules(&mut self, rules: Vec<ResolvedRulePlan>) {
+        if rules.is_empty() {
+            return;
+        }
+        let mut schedule = self.schedule.write().unwrap();
+        for rule in rules {
+            self.rule_roots
+                .entry(rule.ruleset.clone())
+                .or_default()
+                .push(rule.lhs_anchor.clone());
+            if let Some(root) = rule.root {
+                schedule.roots.insert(rule.name.clone(), root);
+            }
+            if !rule.anchors.is_empty() {
+                schedule.anchors.insert(rule.name.clone(), rule.anchors);
+            }
+            if !self.rulesets.contains(&rule.ruleset) {
+                self.rulesets.push(rule.ruleset);
+            }
+        }
+    }
+
+    fn ruleset_is_fully_focused(&self, ruleset: &str) -> bool {
+        let Some(roots) = self.rule_roots.get(ruleset) else {
+            return false;
+        };
+        !roots.is_empty()
+            && roots.iter().all(|root| {
+                root.as_deref()
+                    .is_some_and(|root| self.anchor_is_fully_focused(root))
+            })
+    }
+
+    fn anchor_is_fully_focused(&self, anchor: &str) -> bool {
+        let Some(function) = self.egraph.get_function(anchor) else {
+            return false;
+        };
+        let sort = function.schema().output.clone();
+        let sort_name = sort.name().to_owned();
+        let focus = &self.schedule.read().unwrap().focus;
+        let mut all = true;
+        if self
             .egraph
-            .parser
-            .get_program_from_string(None, rewrites)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        reject_nonmonotone_commands(&commands)?;
-        self.egraph
-            .desugar_program(None, rewrites)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        self.install_managed_commands(commands)
-    }
-
-    fn install_managed_commands(
-        &mut self,
-        commands: Vec<Command>,
-    ) -> Result<usize, LiveMonitorError> {
-        let plan = build_managed_rewrite_plan(
-            &mut self.egraph,
-            &self.names,
-            &self.private_prefix,
-            commands,
-        )?;
-        self.egraph
-            .run_program(plan.commands)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        self.names.saturation_reach = plan.saturation_reach;
-        self.names.saturation_initialized = plan.saturation_initialized;
-        self.names.projected_functions = plan.projected_functions;
-        self.names.installed_rewrite_directions = plan.installed_rewrite_directions;
-        Ok(plan.rewrite_count)
-    }
-
-    fn sync_context_functions(
-        &mut self,
-        declared_functions: BTreeSet<String>,
-    ) -> Result<(), LiveMonitorError> {
-        let mut known_functions = self.names.known_functions.clone();
-        known_functions.extend(
-            declared_functions
-                .into_iter()
-                .filter(|name| self.egraph.get_function(name).is_some()),
-        );
-        if known_functions == self.names.known_functions {
-            return Ok(());
-        }
-        if !self.names.saturation_initialized {
-            self.names.known_functions = known_functions;
-            return Ok(());
-        }
-
-        let mut saturation_reach = self.names.saturation_reach.clone();
-        let mut projected_functions = self.names.projected_functions.clone();
-        let mut declarations = Vec::new();
-        append_saturation_projections(
-            &self.egraph,
-            &self.names.saturation_ruleset,
-            &self.private_prefix,
-            known_functions.iter().cloned(),
-            &mut saturation_reach,
-            &mut projected_functions,
-            &mut declarations,
-        );
-        self.egraph
-            .run_program(declarations)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        self.names.known_functions = known_functions;
-        self.names.saturation_reach = saturation_reach;
-        self.names.projected_functions = projected_functions;
-        Ok(())
-    }
-
-    fn saturate_matcher(&mut self, round_limit: usize) -> Result<SaturationRun, LiveMonitorError> {
-        let mut projection_matches = 0usize;
-        let mut basin_matches = 0usize;
-        if !self.names.saturation_initialized {
-            let mut rounds = 0usize;
-            let complete = loop {
-                if rounds == round_limit {
-                    break false;
-                }
-                rounds = rounds.saturating_add(1);
-                let projection = self
-                    .egraph
-                    .step_rules(&self.names.ruleset)
-                    .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-                projection_matches = projection_matches.saturating_add(
-                    projection
-                        .num_matches_per_rule
-                        .values()
-                        .copied()
-                        .sum::<usize>(),
-                );
-                if !projection.updated {
-                    break true;
-                }
-            };
-            return Ok(SaturationRun {
-                complete,
-                rounds,
-                projection_matches,
-                basin_matches: 0,
+            .constructor_enodes_while(anchor, |enode| {
+                all = focus.contains(&FocusValue {
+                    sort: sort_name.clone(),
+                    value: self.canonical(&sort, enode.eclass),
+                });
+                all
+            })
+            .is_err()
+        {
+            let _ = self.egraph.function_entries_while(anchor, |entry| {
+                all = focus.contains(&FocusValue {
+                    sort: sort_name.clone(),
+                    value: self.canonical(&sort, entry.output),
+                });
+                all
             });
         }
-        let mut rounds = 0usize;
-        let complete = loop {
-            if rounds == round_limit {
-                break false;
-            }
-            rounds = rounds.saturating_add(1);
-            let relevant = self
-                .egraph
-                .step_rules(&self.names.relevant_ruleset)
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-            let saturation = self
-                .egraph
-                .step_rules(&self.names.saturation_ruleset)
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-            let projection = self
-                .egraph
-                .step_rules(&self.names.ruleset)
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-            basin_matches = basin_matches.saturating_add(
-                relevant
-                    .num_matches_per_rule
-                    .values()
-                    .copied()
-                    .sum::<usize>(),
-            );
-            projection_matches = projection_matches.saturating_add(
-                saturation
-                    .num_matches_per_rule
-                    .values()
-                    .copied()
-                    .sum::<usize>(),
-            );
-            projection_matches = projection_matches.saturating_add(
-                projection
-                    .num_matches_per_rule
-                    .values()
-                    .copied()
-                    .sum::<usize>(),
-            );
-            if !relevant.updated && !saturation.updated && !projection.updated {
-                break true;
-            }
+        all
+    }
+
+    fn refresh_active_rules(&self) {
+        let (anchors, focus) = {
+            let schedule = self.schedule.read().unwrap();
+            (schedule.anchors.clone(), schedule.focus.clone())
         };
-        Ok(SaturationRun {
-            complete,
-            rounds,
-            projection_matches,
-            basin_matches,
-        })
-    }
-
-    fn take_delta(&mut self, saturation: SaturationRun) -> BackendDelta {
-        let captured = std::mem::take(&mut *self.captures.lock().unwrap());
-        let mut changes = Vec::new();
-        let mut changed_constructors = vec![false; self.view.enodes.len()];
-        for fact in captured {
-            match fact {
-                CapturedFact::Enode {
-                    constructor,
-                    output,
-                    children,
-                } => {
-                    let schema = &self.constructor_schemas[constructor];
-                    let output = self.canonical_value(TypedClass {
-                        sort: schema.output,
-                        class: ValueId::from_egglog(output),
-                    });
-                    let children = children
-                        .into_iter()
-                        .zip(&schema.inputs)
-                        .map(|(class, &sort)| {
-                            self.canonical_value(TypedClass {
-                                sort,
-                                class: ValueId::from_egglog(class),
-                            })
-                            .class
-                        })
-                        .collect::<Vec<_>>();
-                    let enode = CoreEnode {
-                        output: output.class,
-                        children: children.into(),
-                    };
-                    if self.view.enode_seen[constructor].insert(enode.clone()) {
-                        self.view.enodes[constructor].push(enode);
-                    }
-                    // Rebuild can canonicalize an affected row to one already
-                    // stored here. The row still has to wake the cross-product
-                    // because an old parser fact may only now compare equal.
-                    changed_constructors[constructor] = true;
-                }
-                CapturedFact::Domain {
-                    sort,
-                    value,
-                    lexical_form,
-                    integer,
-                } => {
-                    let value = self
-                        .canonical_value(TypedClass {
-                            sort,
-                            class: ValueId::from_egglog(value),
-                        })
-                        .class;
-                    for terminal in 0..self.view.terminals.len() {
-                        let terminal_id = TerminalId(terminal);
-                        let uses_sort = self.names.token_sorts[terminal]
-                            .iter()
-                            .any(|token| self.names.sorts[&token.sort].id == sort);
-                        let matches = uses_sort
-                            && (integer.is_some_and(|integer| {
-                                self.input.i64_lexeme_matches(terminal_id, integer)
-                            }) || (integer.is_none()
-                                && self.input.lexeme_matches(terminal_id, &lexical_form)));
-                        let typed = TypedClass { sort, class: value };
-                        if matches && self.view.terminal_seen[terminal].insert(typed) {
-                            self.view.terminals[terminal].push(typed);
-                            changes.push(EGraphChange::Terminal(
-                                u32::try_from(terminal).expect("terminal count exceeds u32"),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        let target = self
-            .egraph
-            .get_canonical_value(self.target.value, &self.target.sort);
-        self.view.targets.clear();
-        self.view.targets.push(TypedClass {
-            sort: self.target.sort_id,
-            class: ValueId::from_egglog(target),
-        });
-        changes.push(EGraphChange::Target);
-        changes.extend(changed_constructors.into_iter().enumerate().filter_map(
-            |(constructor, changed)| changed.then_some(EGraphChange::Constructor(constructor)),
-        ));
-        BackendDelta {
-            changes,
-            saturation,
-        }
-    }
-
-    fn canonical_value(&self, value: TypedClass<ValueId>) -> TypedClass<ValueId> {
-        TypedClass {
-            sort: value.sort,
-            class: ValueId::from_egglog(
-                self.egraph.get_canonical_value(
-                    value.class.into_egglog(),
-                    &self.sort_metadata[value.sort].1,
-                ),
-            ),
-        }
-    }
-
-    fn recall_expr(&self, value: TypedClass<ValueId>) -> Expr {
-        let mut values = self.recall.values.lock().unwrap();
-        let index = i64::try_from(values.len()).expect("focused value count exceeds i64");
-        values.push(value.class.into_egglog());
-        Expr::Call(
-            egglog::span!(),
-            self.recall.names[value.sort].clone(),
-            vec![Expr::Lit(egglog::span!(), Literal::Int(index))],
-        )
-    }
-
-    pub(crate) fn focus_enabled(&self) -> bool {
-        self.names.saturation_initialized
-    }
-}
-
-impl EGraphView<ValueId> for EgglogBackend {
-    fn canonical(&self, value: TypedClass<ValueId>) -> TypedClass<ValueId> {
-        self.canonical_value(value)
-    }
-
-    fn targets(&self) -> &[TypedClass<ValueId>] {
-        &self.view.targets
-    }
-
-    fn terminal_classes(&self, terminal: u32) -> &[TypedClass<ValueId>] {
-        self.view
-            .terminals
-            .get(terminal as usize)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-
-    fn enodes(&self, constructor: ConstructorId) -> &[CoreEnode<ValueId>] {
-        self.view
-            .enodes
-            .get(constructor)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-}
-
-impl EGraphWriter<ValueId> for EgglogBackend {
-    type Error = LiveMonitorError;
-
-    fn construct(
-        &mut self,
-        constructor: ConstructorId,
-        children: &[TypedClass<ValueId>],
-    ) -> Result<TypedClass<ValueId>, Self::Error> {
-        let expression = Expr::Call(
-            egglog::span!(),
-            self.constructor_names[constructor].clone(),
-            children
+        let mut active = HashSet::new();
+        for (rule, anchors) in anchors {
+            if anchors
                 .iter()
-                .copied()
-                .map(|child| self.recall_expr(child))
-                .collect(),
-        );
-        let (_, output) = self
-            .egraph
-            .eval_expr(&expression)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        let schema = &self.constructor_schemas[constructor];
-        let output = self.canonical_value(TypedClass {
-            sort: schema.output,
-            class: ValueId::from_egglog(output),
-        });
-        let enode = CoreEnode {
-            output: output.class,
-            children: children.iter().map(|child| child.class).collect(),
-        };
-        if self.view.enode_seen[constructor].insert(enode.clone()) {
-            self.view.enodes[constructor].push(enode);
-        }
-        Ok(output)
-    }
-
-    fn mark_relevant(&mut self, values: &[TypedClass<ValueId>]) -> Result<(), Self::Error> {
-        let mut actions = Vec::new();
-        for value in values.iter().copied() {
-            let value = self.canonical_value(value);
-            if !self
-                .relevance_marked_values
-                .insert((value.sort, value.class.into_egglog()))
+                .any(|anchor| self.anchor_touches_focus(anchor, &focus))
             {
-                continue;
-            }
-            let sort_name = &self.sort_metadata[value.sort].0;
-            if let Some(relation) = self.names.saturation_reach.get(sort_name) {
-                actions.push(call_command(relation, vec![self.recall_expr(value)]));
+                active.insert(rule);
             }
         }
-        if !actions.is_empty() {
+        self.schedule.write().unwrap().active = active;
+    }
+
+    fn anchor_touches_focus(&self, anchor: &str, focus: &HashSet<FocusValue>) -> bool {
+        let Some(function) = self.egraph.get_function(anchor) else {
+            return false;
+        };
+        let sort = function.schema().output.clone();
+        let sort_name = sort.name().to_owned();
+        let mut found = false;
+        if self
+            .egraph
+            .constructor_enodes_while(anchor, |enode| {
+                found = focus.contains(&FocusValue {
+                    sort: sort_name.clone(),
+                    value: self.canonical(&sort, enode.eclass),
+                });
+                !found
+            })
+            .is_err()
+        {
+            let _ = self.egraph.function_entries_while(anchor, |entry| {
+                found = focus.contains(&FocusValue {
+                    sort: sort_name.clone(),
+                    value: self.canonical(&sort, entry.output),
+                });
+                !found
+            });
+        }
+        found
+    }
+
+    fn close_focus_downward(&self) -> bool {
+        // Read each Egglog row once, then traverse the reachable children in
+        // memory. Repeated whole-table scans would make an n-deep target cost
+        // O(n²) even though its e-node graph has only n edges.
+        let mut children = HashMap::<FocusValue, Vec<FocusValue>>::new();
+        for (constructor, schema) in self.constructors.iter().zip(&*self.constructor_schemas) {
+            let output_sort = &self.sorts[schema.output];
             self.egraph
-                .run_program(actions)
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
+                .constructor_enodes(&constructor.name, |enode| {
+                    let output = FocusValue {
+                        sort: output_sort.name.clone(),
+                        value: self.canonical(&output_sort.sort, enode.eclass),
+                    };
+                    let row = children.entry(output).or_default();
+                    for (&child, &sort_id) in enode.children.iter().zip(&schema.inputs) {
+                        let sort = &self.sorts[sort_id];
+                        row.push(FocusValue {
+                            sort: sort.name.clone(),
+                            value: self.canonical(&sort.sort, child),
+                        });
+                    }
+                })
+                .expect("grammar actions were validated as constructors");
         }
-        Ok(())
-    }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SaturationRun {
-    pub(crate) complete: bool,
-    pub(crate) rounds: usize,
-    pub(crate) projection_matches: usize,
-    pub(crate) basin_matches: usize,
-}
-
-struct ManagedRewritePlan {
-    commands: Vec<Command>,
-    saturation_reach: BTreeMap<String, String>,
-    saturation_initialized: bool,
-    projected_functions: BTreeSet<String>,
-    installed_rewrite_directions: BTreeSet<String>,
-    rewrite_count: usize,
-}
-
-fn build_managed_rewrite_plan(
-    egraph: &mut EGraph,
-    names: &MatcherNames,
-    private_prefix: &str,
-    commands: Vec<Command>,
-) -> Result<ManagedRewritePlan, LiveMonitorError> {
-    let mut rewrites = Vec::<Rewrite>::new();
-    let mut installed_rewrite_directions = names.installed_rewrite_directions.clone();
-    let mut function_names = BTreeSet::new();
-    let mut rewrite_count = 0usize;
-    for command in commands {
-        match command {
-            Command::Rewrite(_, rewrite, false) => {
-                if register_managed_direction(
-                    rewrite,
-                    &mut installed_rewrite_directions,
-                    &mut function_names,
-                    &mut rewrites,
-                ) {
-                    rewrite_count = rewrite_count.saturating_add(1);
-                }
-            }
-            Command::BiRewrite(_, rewrite) => {
-                let reverse = Rewrite {
-                    span: rewrite.span.clone(),
-                    lhs: rewrite.rhs.clone(),
-                    rhs: rewrite.lhs.clone(),
-                    conditions: rewrite.conditions.clone(),
-                };
-                let forward_added = register_managed_direction(
-                    rewrite,
-                    &mut installed_rewrite_directions,
-                    &mut function_names,
-                    &mut rewrites,
-                );
-                let reverse_added = register_managed_direction(
-                    reverse,
-                    &mut installed_rewrite_directions,
-                    &mut function_names,
-                    &mut rewrites,
-                );
-                if forward_added || reverse_added {
-                    rewrite_count = rewrite_count.saturating_add(1);
-                }
-            }
-            Command::Rewrite(_, _, true) => {
-                return Err(LiveMonitorError::NonMonotoneUpdate(":subsume".to_owned()));
-            }
-            other => {
-                return Err(LiveMonitorError::UnsupportedManagedSaturationCommand(
-                    command_kind(&other).to_owned(),
-                ));
-            }
-        }
-    }
-
-    let mut saturation_reach = names.saturation_reach.clone();
-    let mut projected_functions = names.projected_functions.clone();
-    let mut declarations = Vec::new();
-    let saturation_initialized = names.saturation_initialized || !rewrites.is_empty();
-    if !names.saturation_initialized && !rewrites.is_empty() {
-        for sort in names.sorts.values() {
-            let (Some(target_reach), Some(saturation_reach)) =
-                (&sort.reach, names.saturation_reach.get(&sort.name))
-            else {
+        let mut schedule = self.schedule.write().unwrap();
+        let mut agenda = schedule.focus.iter().cloned().collect::<Vec<_>>();
+        let mut changed = false;
+        while let Some(value) = agenda.pop() {
+            let Some(row) = children.get(&value) else {
                 continue;
             };
-            declarations.push(reach_bridge_rule(
-                &names.saturation_ruleset,
-                target_reach,
-                saturation_reach,
-            ));
+            for child in row {
+                if schedule.focus.insert(child.clone()) {
+                    changed = true;
+                    agenda.push(child.clone());
+                }
+            }
+        }
+        changed
+    }
+
+    fn recanonicalize_focus(&self) {
+        let old = std::mem::take(&mut self.schedule.write().unwrap().focus);
+        let mut new = HashSet::with_capacity(old.len());
+        for value in old {
+            if let Some(sort) = self.egraph.get_sort_by_name(&value.sort) {
+                new.insert(FocusValue {
+                    sort: value.sort,
+                    value: self.canonical(sort, value.value),
+                });
+            }
+        }
+        self.schedule.write().unwrap().focus = new;
+    }
+
+    fn canonical(&self, sort: &ArcSort, value: Value) -> Value {
+        if !sort.is_eq_sort() {
+            return value;
+        }
+        let class = self.egraph.value_to_class_id(sort, value);
+        self.egraph.class_id_to_value(&class)
+    }
+
+    fn mark_all(&mut self) {
+        self.mark(EGraphChange::Target);
+        for constructor in 0..self.constructors.len() {
+            self.mark_constructor(constructor);
+        }
+        for terminal in 0..self.token_sorts.len() {
+            self.mark(EGraphChange::Terminal(terminal as u32));
         }
     }
-    if saturation_initialized {
-        function_names.extend(names.known_functions.iter().cloned());
-        append_saturation_projections(
-            egraph,
-            &names.saturation_ruleset,
-            private_prefix,
-            function_names,
-            &mut saturation_reach,
-            &mut projected_functions,
-            &mut declarations,
-        );
+
+    fn mark_constructor(&mut self, constructor: ConstructorId) {
+        self.mark(EGraphChange::Constructor(constructor));
     }
-    for rewrite in &rewrites {
-        append_guarded_direction(egraph, &saturation_reach, names, rewrite, &mut declarations)?;
+
+    fn mark(&mut self, change: EGraphChange) {
+        if !self.pending.contains(&change) {
+            self.pending.push(change);
+        }
     }
-    Ok(ManagedRewritePlan {
-        commands: declarations,
-        saturation_reach,
-        saturation_initialized,
-        projected_functions,
-        installed_rewrite_directions,
-        rewrite_count,
+}
+
+struct ResolvedRulePlan {
+    name: String,
+    ruleset: String,
+    lhs_anchor: Option<String>,
+    root: Option<MatchRoot>,
+    anchors: Vec<String>,
+}
+
+fn run_commands(
+    egraph: &mut EGraph,
+    commands: Vec<Command>,
+) -> Result<Vec<ResolvedRulePlan>, MonitorError> {
+    let mut plans = Vec::new();
+    for command in commands.into_iter().flat_map(directed_rewrites) {
+        if !command_defines_rule(&command) {
+            egraph.run_program(vec![command]).map_err(egglog_error)?;
+            continue;
+        }
+        // Resolve with Egglog itself, then register exactly that desugaring.
+        // The clone prevents the preview's type/name bookkeeping from being
+        // applied twice to the real e-graph.
+        let mut preview = egraph.clone();
+        let resolved = preview
+            .resolve_program(None, &command.to_string())
+            .map_err(egglog_error)?;
+        plans.extend(resolved_rule_plans(
+            &resolved,
+            &mut preview.parser.symbol_gen,
+        ));
+        // Register the user's command itself. The resolved copy above is only
+        // scheduler metadata; it never replaces user logic.
+        egraph.run_program(vec![command]).map_err(egglog_error)?;
+    }
+    Ok(plans)
+}
+
+fn directed_rewrites(command: Command) -> Vec<Command> {
+    let Command::BiRewrite(ruleset, rewrite) = command else {
+        return vec![command];
+    };
+    let base = if rewrite.name.is_empty() {
+        egglog::ast::desugar::rule_name(&Command::BiRewrite(ruleset.clone(), rewrite.clone()))
+    } else {
+        rewrite.name.clone()
+    };
+    let mut forward = rewrite.clone();
+    forward.name = format!("{base}=>");
+    let reverse = egglog::ast::Rewrite {
+        span: rewrite.span,
+        lhs: rewrite.rhs,
+        rhs: rewrite.lhs,
+        conditions: rewrite.conditions,
+        name: format!("{base}<="),
+    };
+    vec![
+        Command::Rewrite(ruleset.clone(), forward, false),
+        Command::Rewrite(ruleset, reverse, false),
+    ]
+}
+
+fn resolved_rule_plans(
+    resolved: &[ResolvedCommand],
+    symbol_gen: &mut egglog::util::SymbolGen,
+) -> Vec<ResolvedRulePlan> {
+    resolved
+        .iter()
+        .cloned()
+        .into_iter()
+        .filter_map(|command| match command {
+            ResolvedCommand::Rule { rule } => {
+                let lhs = rewrite_lhs(&rule.body);
+                let root = lhs.map(|call| {
+                    let variable = symbol_gen.fresh(call);
+                    MatchRoot {
+                        variable: variable.name,
+                        sort: variable.sort.name().to_owned(),
+                    }
+                });
+                let lhs_anchor = lhs.map(|call| call.name().to_owned());
+                let anchors = rewrite_anchors(lhs, &rule.head.0);
+                let plan = ResolvedRulePlan {
+                    name: rule.name,
+                    ruleset: rule.ruleset,
+                    lhs_anchor,
+                    root,
+                    anchors,
+                };
+                Some(plan)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn rewrite_anchors(
+    lhs: Option<&egglog::ResolvedCall>,
+    actions: &[egglog::ast::GenericAction<egglog::ResolvedCall, egglog::ast::ResolvedVar>],
+) -> Vec<String> {
+    let Some(lhs) = lhs else {
+        return Vec::new();
+    };
+    let mut anchors = Vec::new();
+    for action in actions {
+        let egglog::ast::GenericAction::Union(_, _, rhs) = action else {
+            continue;
+        };
+        if let egglog::ast::GenericExpr::Call(_, call, _) = rhs {
+            let name = call.name().to_owned();
+            if name != lhs.name() && !anchors.contains(&name) {
+                anchors.push(name);
+            }
+        }
+    }
+    anchors
+}
+
+fn rewrite_lhs(facts: &[egglog::ast::ResolvedFact]) -> Option<&egglog::ResolvedCall> {
+    facts.iter().find_map(|fact| {
+        let egglog::ast::GenericFact::Eq(_, left, right) = fact else {
+            return None;
+        };
+        match (left, right) {
+            (
+                egglog::ast::GenericExpr::Var(_, variable),
+                egglog::ast::GenericExpr::Call(_, call, _),
+            )
+            | (
+                egglog::ast::GenericExpr::Call(_, call, _),
+                egglog::ast::GenericExpr::Var(_, variable),
+            ) if variable.name.contains("rewrite_var__") => Some(call),
+            _ => None,
+        }
     })
 }
 
-fn register_managed_direction(
-    rewrite: Rewrite,
-    installed_rewrite_directions: &mut BTreeSet<String>,
-    function_names: &mut BTreeSet<String>,
-    rewrites: &mut Vec<Rewrite>,
-) -> bool {
-    if !installed_rewrite_directions.insert(rewrite_direction_key(&rewrite)) {
-        return false;
-    }
-    collect_rewrite_functions(&rewrite, function_names);
-    rewrites.push(rewrite);
-    true
+fn command_defines_rule(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Rule { .. } | Command::Rewrite(..) | Command::BiRewrite(..)
+    )
 }
 
-fn append_saturation_projections(
-    egraph: &EGraph,
-    ruleset: &str,
-    private_prefix: &str,
-    function_names: impl IntoIterator<Item = String>,
-    reaches: &mut BTreeMap<String, String>,
-    projected_functions: &mut BTreeSet<String>,
-    declarations: &mut Vec<Command>,
-) {
-    for function_name in function_names {
-        if projected_functions.contains(&function_name) {
-            continue;
-        }
-        let Some(function) = egraph.get_function(&function_name) else {
-            // Primitive calls have no e-graph table whose children could be
-            // congruence-relevant.
-            continue;
-        };
-        let schema = function.schema();
-        let output_is_equality = schema.output.is_eq_sort();
-        let output_sort = schema.output.name().to_owned();
-        let input_sorts = schema.input.clone();
-        let ordinal = projected_functions.len();
-        projected_functions.insert(function_name.clone());
-        if !output_is_equality {
-            continue;
-        }
-        let output_reach =
-            ensure_reach_relation(reaches, private_prefix, &output_sort, declarations);
-        let mut equality_children = Vec::new();
-        for (argument, sort) in input_sorts.iter().enumerate() {
-            if sort.is_eq_sort() {
-                let reach =
-                    ensure_reach_relation(reaches, private_prefix, sort.name(), declarations);
-                equality_children.push((argument, reach));
-            }
-        }
-        if !equality_children.is_empty() {
-            declarations.push(projection_rule(
-                ruleset,
-                private_prefix,
-                ordinal,
-                &function_name,
-                input_sorts.len(),
-                &output_reach,
-                &equality_children,
-            ));
-        }
-    }
+fn without_schedules(commands: Vec<Command>) -> Vec<Command> {
+    commands
+        .into_iter()
+        .filter(|command| !matches!(command, Command::RunSchedule(..)))
+        .collect()
 }
 
-fn rewrite_direction_key(rewrite: &Rewrite) -> String {
-    Command::Rewrite(String::new(), rewrite.clone(), false).to_string()
-}
-
-fn ensure_reach_relation(
-    reaches: &mut BTreeMap<String, String>,
-    private_prefix: &str,
-    sort: &str,
-    declarations: &mut Vec<Command>,
-) -> String {
-    if let Some(reach) = reaches.get(sort) {
-        return reach.clone();
-    }
-    let reach = format!("{private_prefix}_aux_reach_{}", reaches.len());
-    declarations.push(Command::Relation {
-        span: egglog::span!(),
-        name: reach.clone(),
-        inputs: vec![sort.to_owned()],
-    });
-    reaches.insert(sort.to_owned(), reach.clone());
-    reach
-}
-
-fn reach_bridge_rule(ruleset: &str, source: &str, destination: &str) -> Command {
-    let value = Expr::Var(egglog::span!(), "saturation_value".to_owned());
-    Command::Rule {
-        rule: Rule {
-            span: egglog::span!(),
-            head: GenericActions(vec![EggAction::Expr(
-                egglog::span!(),
-                Expr::Call(egglog::span!(), destination.to_owned(), vec![value.clone()]),
-            )]),
-            body: vec![Fact::Fact(Expr::Call(
-                egglog::span!(),
-                source.to_owned(),
-                vec![value],
-            ))],
-            name: format!("{destination}_bridge"),
-            ruleset: ruleset.to_owned(),
-        },
-    }
-}
-
-fn projection_rule(
-    ruleset: &str,
-    private_prefix: &str,
-    ordinal: usize,
-    function: &str,
-    arity: usize,
-    output_reach: &str,
-    equality_children: &[(usize, String)],
-) -> Command {
-    let output = Expr::Var(egglog::span!(), "relevant_output".to_owned());
-    let children = (0..arity)
-        .map(|argument| Expr::Var(egglog::span!(), format!("relevant_child_{argument}")))
-        .collect::<Vec<_>>();
-    let body = vec![
-        Fact::Fact(Expr::Call(
-            egglog::span!(),
-            output_reach.to_owned(),
-            vec![output.clone()],
-        )),
-        Fact::Eq(
-            egglog::span!(),
-            output,
-            Expr::Call(egglog::span!(), function.to_owned(), children.clone()),
-        ),
-    ];
-    let head = equality_children
-        .iter()
-        .map(|(argument, reach)| {
-            EggAction::Expr(
-                egglog::span!(),
-                Expr::Call(
-                    egglog::span!(),
-                    reach.clone(),
-                    vec![children[*argument].clone()],
-                ),
-            )
-        })
-        .collect();
-    Command::Rule {
-        rule: Rule {
-            span: egglog::span!(),
-            head: GenericActions(head),
-            body,
-            name: format!("{private_prefix}_dynamic_projection_{ordinal}"),
-            ruleset: ruleset.to_owned(),
-        },
-    }
-}
-
-fn append_guarded_direction(
-    egraph: &mut EGraph,
-    reaches: &BTreeMap<String, String>,
-    names: &MatcherNames,
-    rewrite: &Rewrite,
-    output: &mut Vec<Command>,
-) -> Result<(), LiveMonitorError> {
-    let sort = expression_sort(egraph, &rewrite.lhs)
-        .or_else(|| expression_sort(egraph, &rewrite.rhs))
-        .ok_or(LiveMonitorError::UnsupportedManagedRewrite)?;
-    let reach = reaches
-        .get(&sort)
-        .ok_or(LiveMonitorError::UnsupportedManagedRewrite)?;
-    // Every managed direction is forward-only and fires only when its LHS is
-    // already in the target-rooted saturation basin. A birewrite reaches this
-    // helper twice, once for each direction.
-    output.push(guarded_rewrite(
-        &names.relevant_ruleset,
-        rewrite,
-        reach,
-        &rewrite.lhs,
-    ));
-    Ok(())
-}
-
-fn guarded_rewrite(ruleset: &str, rewrite: &Rewrite, reach: &str, guard: &Expr) -> Command {
-    let mut guarded = rewrite.clone();
-    guarded.conditions.push(Fact::Fact(Expr::Call(
-        egglog::span!(),
-        reach.to_owned(),
-        vec![guard.clone()],
-    )));
-    Command::Rewrite(ruleset.to_owned(), guarded, false)
-}
-
-fn expression_sort(egraph: &mut EGraph, expression: &Expr) -> Option<String> {
-    match expression {
-        Expr::Call(_, function, _) => egraph
-            .get_function(function)
-            .map(|function| function.schema().output.name().to_owned()),
-        Expr::Var(_, variable) if variable.starts_with('$') => egraph
-            .eval_expr(expression)
-            .ok()
-            .map(|(sort, _)| sort.name().to_owned()),
-        Expr::Var(..) | Expr::Lit(..) => None,
-    }
-}
-
-fn collect_rewrite_functions(rewrite: &Rewrite, functions: &mut BTreeSet<String>) {
-    collect_expr_functions(&rewrite.lhs, functions);
-    collect_expr_functions(&rewrite.rhs, functions);
-    for condition in &rewrite.conditions {
-        match condition {
-            Fact::Eq(_, left, right) => {
-                collect_expr_functions(left, functions);
-                collect_expr_functions(right, functions);
-            }
-            Fact::Fact(expression) => collect_expr_functions(expression, functions),
-        }
-    }
-}
-
-fn collect_expr_functions(expression: &Expr, functions: &mut BTreeSet<String>) {
-    if let Expr::Call(_, function, children) = expression {
-        functions.insert(function.clone());
-        for child in children {
-            collect_expr_functions(child, functions);
-        }
-    }
-}
-
-fn command_kind(command: &Command) -> &'static str {
-    match command {
-        Command::Sort(..) => "sort",
-        Command::Function { .. } => "function",
-        Command::Constructor { .. } => "constructor",
-        Command::Relation { .. } => "relation",
-        Command::Datatype { .. } => "datatype",
-        Command::Datatypes { .. } => "datatypes",
-        Command::AddRuleset(..) => "ruleset",
-        Command::UnstableCombinedRuleset(..) => "combined-ruleset",
-        Command::Rule { .. } => "rule",
-        Command::Rewrite(..) => "rewrite",
-        Command::BiRewrite(..) => "birewrite",
-        Command::Action(..) => "action",
-        Command::Extract(..) => "extract",
-        Command::RunSchedule(..) => "run-schedule",
-        Command::PrintOverallStatistics(..) => "print-stats",
-        Command::Check(..) => "check",
-        Command::Push(..) => "push",
-        Command::Pop(..) => "pop",
-        Command::PrintFunction(..) => "print-function",
-        Command::PrintSize(..) => "print-size",
-        Command::Input { .. } => "input",
-        Command::Output { .. } => "output",
-        Command::Fail(..) => "fail",
-        Command::Include(..) => "include",
-        Command::UserDefined(..) => "user-defined",
-    }
-}
-
-fn normalize_binding(binding: &str) -> Result<String, LiveMonitorError> {
-    let binding = binding.trim();
-    if binding.is_empty() || binding.chars().any(char::is_whitespace) {
-        return Err(LiveMonitorError::InvalidBinding {
+fn binding_expression(egraph: &mut EGraph, binding: &str) -> Result<Expr, MonitorError> {
+    let trimmed = binding.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return Err(MonitorError::InvalidBinding {
             binding: binding.to_owned(),
             reason: "expected one nonempty global name".to_owned(),
         });
     }
-    Ok(if binding.starts_with('$') {
-        binding.to_owned()
+    let source = if trimmed.starts_with('$') {
+        trimmed.to_owned()
     } else {
-        format!("${binding}")
-    })
-}
-
-fn choose_prefix(egraph: &EGraph, initial_program: &str) -> String {
-    for index in 0usize.. {
-        let prefix = format!("__prefixspace_live_{index}");
-        if !initial_program.contains(&prefix)
-            && egraph.get_function(&format!("{prefix}_targets")).is_none()
-            && egraph.get_function(&format!("{prefix}_reach_0")).is_none()
-        {
-            return prefix;
-        }
+        format!("${trimmed}")
+    };
+    let expression = egraph
+        .parser
+        .get_expr_from_string(None, &source)
+        .map_err(|error| MonitorError::InvalidBinding {
+            binding: binding.to_owned(),
+            reason: error.to_string(),
+        })?;
+    if !matches!(expression, Expr::Var(..)) {
+        return Err(MonitorError::InvalidBinding {
+            binding: binding.to_owned(),
+            reason: "expected one global name".to_owned(),
+        });
     }
-    unreachable!()
+    Ok(expression)
 }
 
-/// Egglog identifiers are unquoted atoms. Ignore comments and escaped string
-/// contents before looking for a private-name prefix, so ordinary user data
-/// cannot collide with the monitor's capability boundary.
-fn source_mentions_identifier_prefix(source: &str, prefix: &str) -> bool {
-    let mut visible = String::with_capacity(source.len());
-    let mut characters = source.chars();
-    let mut in_string = false;
-    let mut in_comment = false;
-    while let Some(character) = characters.next() {
-        if in_comment {
-            if character == '\n' {
-                in_comment = false;
-                visible.push('\n');
-            }
-            continue;
-        }
-        if in_string {
-            if character == '\\' {
-                let _ = characters.next();
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            ';' => in_comment = true,
-            '"' => in_string = true,
-            _ => visible.push(character),
-        }
-    }
-    visible.contains(prefix)
-}
-
-fn build_specs(
+fn build_schema(
     grammar: &Grammar,
-    egraph: &EGraph,
     input: &RuntimeInput,
-    prefix: &str,
-    target_sort: &str,
-    declared_constructors: &BTreeSet<String>,
-    known_functions: BTreeSet<String>,
-) -> Result<MatcherNames, LiveMonitorError> {
-    let mut constructors = HashMap::<String, ConstructorSpec>::new();
-    let mut sorts = BTreeMap::<String, ArcSort>::new();
-    let target = egraph
-        .get_sort_by_name(target_sort)
-        .expect("target sort was returned by egglog")
-        .clone();
-    sorts.insert(target_sort.to_owned(), target);
-    let mut token_usages = BTreeSet::<(usize, String)>::new();
-    // A terminal's egglog sort is not necessarily visible at the production
-    // which selects it.  Unit productions such as `id: ID { $1 }` pass that
-    // value through, and the required sort can be imposed by a constructor
-    // arbitrarily far up the chain (or by the distinguished start value).
-    // Track those equality constraints for every grammar symbol, then close
-    // the Project edges below before installing the lexical matcher rules.
-    let nonterminal_count = grammar.nonterminal_count();
-    let mut symbol_sorts =
-        vec![BTreeSet::<String>::new(); nonterminal_count + grammar.terminal_count()];
-    symbol_sorts[grammar.start().index()].insert(target_sort.to_owned());
-
+    egraph: &EGraph,
+    target_sort: &ArcSort,
+) -> Result<
+    (
+        Vec<SortSpec>,
+        Vec<ValidatedConstructor>,
+        HashMap<String, ConstructorId>,
+        Vec<Vec<TokenSortSpec>>,
+    ),
+    MonitorError,
+> {
+    let mut sort_map = BTreeMap::<String, ArcSort>::new();
+    sort_map.insert(target_sort.name().to_owned(), target_sort.clone());
+    let mut constructor_names = Vec::<String>::new();
+    let mut constructor_ids = HashMap::<String, ConstructorId>::new();
+    let nonterminals = grammar.nonterminal_count();
+    let mut symbol_sorts = vec![BTreeSet::<String>::new(); nonterminals + grammar.terminal_count()];
+    symbol_sorts[grammar.start().index()].insert(target_sort.name().to_owned());
     let symbol_index = |symbol: Symbol| match symbol {
         Symbol::Nonterminal(nonterminal) => nonterminal.index(),
-        Symbol::Terminal(terminal) => nonterminal_count + terminal.index(),
+        Symbol::Terminal(terminal) => nonterminals + terminal.index(),
     };
 
     for production in grammar.productions() {
@@ -1399,335 +949,121 @@ fn build_specs(
         };
         let function = egraph
             .get_function(constructor)
-            .ok_or_else(|| LiveMonitorError::MissingConstructor(constructor.clone()))?;
-        if !declared_constructors.contains(constructor) {
-            return Err(LiveMonitorError::NonConstructorAction(constructor.clone()));
+            .ok_or_else(|| MonitorError::MissingConstructor(constructor.clone()))?;
+        if egraph.constructor_enodes(constructor, |_| {}).is_err() {
+            return Err(MonitorError::NonConstructorAction(constructor.clone()));
         }
         let schema = function.schema();
         if schema.input.len() != arguments.len() {
-            return Err(LiveMonitorError::ConstructorArity {
+            return Err(MonitorError::ConstructorArity {
                 constructor: constructor.clone(),
                 expected: arguments.len(),
                 actual: schema.input.len(),
             });
         }
-        sorts.insert(schema.output.name().to_owned(), schema.output.clone());
-        for sort in &schema.input {
-            sorts.insert(sort.name().to_owned(), sort.clone());
+        if !constructor_ids.contains_key(constructor) {
+            let id = constructor_names.len();
+            constructor_ids.insert(constructor.clone(), id);
+            constructor_names.push(constructor.clone());
         }
+        sort_map.insert(schema.output.name().to_owned(), schema.output.clone());
         symbol_sorts[production.lhs.index()].insert(schema.output.name().to_owned());
-        let constructor_index = constructors.len();
-        constructors
-            .entry(constructor.clone())
-            .or_insert_with(|| ConstructorSpec {
-                id: constructor_index,
-                name: constructor.clone(),
-                capture: format!("{prefix}_capture_constructor_{constructor_index}"),
-                inputs: schema
-                    .input
-                    .iter()
-                    .map(|sort| sort.name().to_owned())
-                    .collect(),
-                output: schema.output.name().to_owned(),
-            });
-        for (argument, sort) in arguments.iter().zip(&schema.input) {
-            let selected = production.rhs[*argument - 1];
-            symbol_sorts[symbol_index(selected)].insert(sort.name().to_owned());
+        for (position, child_sort) in arguments.iter().zip(&schema.input) {
+            sort_map.insert(child_sort.name().to_owned(), child_sort.clone());
+            symbol_sorts[symbol_index(production.rhs[*position - 1])]
+                .insert(child_sort.name().to_owned());
         }
     }
 
-    // Project actions are semantic equalities.  Propagate in both directions:
-    // a parent constructor can determine the projected child's sort, while a
-    // constructed child can determine the projecting nonterminal's sort.
     loop {
         let mut changed = false;
         for production in grammar.productions() {
-            let Action::Project { position } = &production.action else {
+            let Action::Project { position } = production.action else {
                 continue;
             };
-            let lhs = production.lhs.index();
-            let rhs = symbol_index(production.rhs[*position - 1]);
-            let union = symbol_sorts[lhs]
-                .union(&symbol_sorts[rhs])
+            let left = production.lhs.index();
+            let right = symbol_index(production.rhs[position - 1]);
+            let union = symbol_sorts[left]
+                .union(&symbol_sorts[right])
                 .cloned()
                 .collect::<Vec<_>>();
-            let lhs_len = symbol_sorts[lhs].len();
-            let rhs_len = symbol_sorts[rhs].len();
-            symbol_sorts[lhs].extend(union.iter().cloned());
-            symbol_sorts[rhs].extend(union);
-            changed |= symbol_sorts[lhs].len() != lhs_len || symbol_sorts[rhs].len() != rhs_len;
+            let before = symbol_sorts[left].len() + symbol_sorts[right].len();
+            symbol_sorts[left].extend(union.iter().cloned());
+            symbol_sorts[right].extend(union);
+            changed |= before != symbol_sorts[left].len() + symbol_sorts[right].len();
         }
         if !changed {
             break;
         }
     }
 
-    for terminal_index in 0..grammar.terminal_count() {
-        let terminal = TerminalId(terminal_index);
-        for sort_name in &symbol_sorts[nonterminal_count + terminal_index] {
-            let sort = &sorts[sort_name];
-            if !input.has_lexer() {
-                return Err(LiveMonitorError::SelectedTerminalWithoutLexer(
-                    grammar.terminal_name(terminal).to_owned(),
-                ));
-            }
-            if PrimitiveKind::from_sort(sort).is_none() {
-                return Err(LiveMonitorError::UnsupportedLexicalSort {
-                    terminal: grammar.terminal_name(terminal).to_owned(),
-                    sort: sort_name.clone(),
-                });
-            }
-            token_usages.insert((terminal_index, sort_name.clone()));
-        }
-    }
-
-    let sort_specs = sorts
+    let sorts = sort_map
         .into_iter()
-        .enumerate()
-        .map(|(index, (name, sort))| {
+        .map(|(name, sort)| {
             let primitive = PrimitiveKind::from_sort(&sort);
             if !sort.is_eq_sort() && primitive.is_none() {
-                return Err(LiveMonitorError::UnsupportedSemanticSort(name));
+                return Err(MonitorError::UnsupportedSemanticSort(name));
             }
-            let spec = SortSpec {
-                id: index,
-                name: name.clone(),
-                reach: sort.is_eq_sort().then(|| format!("{prefix}_reach_{index}")),
-                domain: primitive.map(|_| format!("{prefix}_domain_{index}")),
-                capture_domain: primitive.map(|_| format!("{prefix}_capture_domain_{index}")),
+            Ok(SortSpec {
+                name,
+                sort,
                 primitive,
-            };
-            Ok((name, spec))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let mut token_sorts = vec![Vec::new(); grammar.terminal_count()];
-    for (terminal, sort) in token_usages {
-        let kind = sort_specs[&sort].primitive.unwrap();
-        token_sorts[terminal].push(TokenSortSpec { sort, kind });
-    }
-    let saturation_reach = sort_specs
-        .iter()
-        .filter_map(|(sort, spec)| {
-            spec.reach.as_ref().map(|_| {
-                (
-                    sort.clone(),
-                    format!("{prefix}_saturation_reach_{}", spec.id),
-                )
             })
         })
-        .collect();
-    // Source-side saturation rules are installed lazily with the first
-    // managed rewrite so monitors that only consume external egglog updates
-    // retain the original target-projection cost.
-    let projected_functions = BTreeSet::new();
-    Ok(MatcherNames {
-        ruleset: format!("{prefix}_rules"),
-        saturation_ruleset: format!("{prefix}_saturation_rules"),
-        relevant_ruleset: format!("{prefix}_relevant_rules"),
-        targets: format!("{prefix}_targets"),
-        sorts: sort_specs,
-        saturation_reach,
-        saturation_initialized: false,
-        projected_functions,
-        known_functions,
-        installed_rewrite_directions: BTreeSet::new(),
-        constructors,
-        token_sorts,
-    })
-}
+        .collect::<Result<Vec<_>, _>>()?;
+    let sort_ids = sorts
+        .iter()
+        .enumerate()
+        .map(|(id, sort)| (sort.name.clone(), id))
+        .collect::<HashMap<_, _>>();
 
-fn register_capture_primitives(egraph: &mut EGraph, names: &MatcherNames, buffer: CaptureBuffer) {
-    for constructor in names.constructors.values() {
-        let mut sorts = Vec::with_capacity(constructor.inputs.len() + 1);
-        sorts.push(
-            egraph
-                .get_sort_by_name(&constructor.output)
-                .expect("constructor output sort was checked")
-                .clone(),
-        );
-        sorts.extend(constructor.inputs.iter().map(|name| {
-            egraph
-                .get_sort_by_name(name)
-                .expect("constructor input sort was checked")
-                .clone()
-        }));
-        egraph.add_primitive(CaptureEnode {
-            name: constructor.capture.clone(),
-            sorts,
-            constructor: constructor.id,
-            buffer: buffer.clone(),
-        });
-    }
-    for sort in names.sorts.values() {
-        let (Some(kind), Some(capture)) = (sort.primitive, &sort.capture_domain) else {
-            continue;
-        };
-        egraph.add_primitive(CaptureDomain {
-            name: capture.clone(),
-            sort: egraph
-                .get_sort_by_name(&sort.name)
-                .expect("primitive sort was checked")
-                .clone(),
-            sort_id: sort.id,
-            kind,
-            buffer: buffer.clone(),
-        });
-    }
-}
-
-fn constructor_schemas(names: &MatcherNames) -> Vec<ConstructorSchema> {
-    let mut constructors = vec![None; names.constructors.len()];
-    for constructor in names.constructors.values() {
-        constructors[constructor.id] = Some(ConstructorSchema {
-            inputs: constructor
-                .inputs
-                .iter()
-                .map(|sort| names.sorts[sort].id)
-                .collect(),
-            output: names.sorts[&constructor.output].id,
-        });
-    }
-    constructors
-        .into_iter()
-        .map(|constructor| constructor.expect("constructor IDs are contiguous"))
-        .collect()
-}
-
-fn build_matcher_program(names: &MatcherNames, target_sort: &str) -> String {
-    fn call(name: &str, arguments: &[String]) -> String {
-        if arguments.is_empty() {
-            format!("({name})")
-        } else {
-            format!("({name} {})", arguments.join(" "))
-        }
-    }
-
-    fn demand(sort: &SortSpec) -> &str {
-        sort.reach
-            .as_deref()
-            .or(sort.domain.as_deref())
-            .expect("checked semantic sort has a reachability relation")
-    }
-
-    let mut source = format!(
-        "(ruleset {})\n(ruleset {})\n(ruleset {})\n(relation {} ({}))\n",
-        names.ruleset, names.saturation_ruleset, names.relevant_ruleset, names.targets, target_sort
-    );
-    for sort in names.sorts.values() {
-        if let Some(reach) = &sort.reach {
-            source.push_str(&format!("(relation {reach} ({}))\n", sort.name));
-        }
-        if let Some(domain) = &sort.domain {
-            source.push_str(&format!("(relation {domain} ({}))\n", sort.name));
-        }
-    }
-    for (sort, reach) in &names.saturation_reach {
-        source.push_str(&format!("(relation {reach} ({sort}))\n"));
-    }
-
-    let root_reach = names.sorts[target_sort]
-        .reach
-        .as_ref()
-        .expect("target is an equality sort");
-    source.push_str(&format!(
-        "(rule (({} value)) (({} value)) :ruleset {})\n",
-        names.targets, root_reach, names.ruleset
-    ));
-
-    for constructor in names.constructors.values() {
-        let child_values = (0..constructor.inputs.len())
-            .map(|index| format!("value{index}"))
-            .collect::<Vec<_>>();
-        let mut actions = constructor
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(index, sort)| format!("({} value{index})", demand(&names.sorts[sort])))
-            .collect::<Vec<_>>();
-        let mut capture_arguments = vec!["output".to_owned()];
-        capture_arguments.extend(child_values.iter().cloned());
-        actions.push(call(&constructor.capture, &capture_arguments));
-        source.push_str(&format!(
-            "(rule (({} output) (= output {})) ({}) :ruleset {})\n",
-            demand(&names.sorts[&constructor.output]),
-            call(&constructor.name, &child_values),
-            actions.join(" "),
-            names.ruleset
-        ));
-    }
-
-    for sort in names.sorts.values() {
-        if let (Some(domain), Some(capture)) = (&sort.domain, &sort.capture_domain) {
-            source.push_str(&format!(
-                "(rule (({domain} value)) (({capture} value)) :ruleset {})\n",
-                names.ruleset
-            ));
-        }
-    }
-    source
-}
-
-fn insert_target(
-    egraph: &mut EGraph,
-    relation: &str,
-    binding: Expr,
-) -> Result<(), LiveMonitorError> {
-    egraph
-        .run_program(vec![call_command(relation, vec![binding])])
-        .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-    Ok(())
-}
-
-fn call_command(name: &str, arguments: Vec<Expr>) -> Command {
-    Command::Action(EggAction::Expr(
-        egglog::span!(),
-        Expr::Call(egglog::span!(), name.to_owned(), arguments),
-    ))
-}
-
-fn collect_declared_constructors(commands: &[Command]) -> BTreeSet<String> {
-    let mut constructors = BTreeSet::new();
-    for command in commands {
-        match command {
-            Command::Constructor { name, .. } => {
-                constructors.insert(name.clone());
+    let constructors = constructor_names
+        .iter()
+        .map(|name| {
+            let schema = egraph.get_function(name).unwrap().schema();
+            ValidatedConstructor {
+                name: name.clone(),
+                schema: ConstructorSchema {
+                    inputs: schema
+                        .input
+                        .iter()
+                        .map(|sort| sort_ids[sort.name()])
+                        .collect(),
+                    output: sort_ids[schema.output.name()],
+                },
             }
-            Command::Datatype { variants, .. } => {
-                constructors.extend(variants.iter().map(|variant| variant.name.clone()));
+        })
+        .collect::<Vec<_>>();
+
+    let mut token_sorts = vec![Vec::new(); grammar.terminal_count()];
+    for terminal in 0..grammar.terminal_count() {
+        for sort_name in &symbol_sorts[nonterminals + terminal] {
+            if !input.has_lexer() {
+                return Err(MonitorError::SelectedTerminalWithoutLexer(
+                    grammar.terminal_name(TerminalId(terminal)).to_owned(),
+                ));
             }
-            Command::Datatypes { datatypes, .. } => {
-                for (_, _, definition) in datatypes {
-                    if let Subdatatypes::Variants(variants) = definition {
-                        constructors.extend(variants.iter().map(|variant| variant.name.clone()));
-                    }
-                }
-            }
-            _ => {}
+            let id = sort_ids[sort_name];
+            let Some(kind) = sorts[id].primitive else {
+                return Err(MonitorError::UnsupportedLexicalSort {
+                    terminal: grammar.terminal_name(TerminalId(terminal)).to_owned(),
+                    sort: sort_name.clone(),
+                });
+            };
+            token_sorts[terminal].push(TokenSortSpec { sort: id, kind });
         }
     }
-    constructors
+    Ok((sorts, constructors, constructor_ids, token_sorts))
 }
 
-fn collect_declared_functions(commands: &[Command]) -> BTreeSet<String> {
-    let mut functions = collect_declared_constructors(commands);
-    for command in commands {
-        if let Command::Function { name, .. } = command {
-            functions.insert(name.clone());
-        }
+fn reject_nonmonotone_commands(commands: &[Command]) -> Result<(), MonitorError> {
+    fn reject(name: &str) -> Result<(), MonitorError> {
+        Err(MonitorError::NonMonotoneUpdate(name.to_owned()))
     }
-    functions
-}
-
-fn reject_nonmonotone_commands(commands: &[Command]) -> Result<(), LiveMonitorError> {
-    fn reject(name: &str) -> Result<(), LiveMonitorError> {
-        Err(LiveMonitorError::NonMonotoneUpdate(name.to_owned()))
+    fn reject_operational(name: &str) -> Result<(), MonitorError> {
+        Err(MonitorError::UnsupportedUpdateCommand(name.to_owned()))
     }
-
-    fn reject_operational(name: &str) -> Result<(), LiveMonitorError> {
-        Err(LiveMonitorError::UnsupportedUpdateCommand(name.to_owned()))
-    }
-
-    fn check_action(action: &EggAction) -> Result<(), LiveMonitorError> {
+    fn check_action(action: &EggAction) -> Result<(), MonitorError> {
         match action {
             EggAction::Set(..) => reject("set"),
             EggAction::Change(_, Change::Delete, ..) => reject("delete"),
@@ -1754,22 +1090,17 @@ fn reject_nonmonotone_commands(commands: &[Command]) -> Result<(), LiveMonitorEr
             Command::Fail(..) => return reject_operational("fail"),
             Command::Extract(..) => return reject_operational("extract"),
             Command::Check(..) => return reject_operational("check"),
+            Command::Prove(..) | Command::ProveExists(..) => return reject_operational("prove"),
             Command::PrintOverallStatistics(..) => return reject_operational("print-stats"),
             Command::PrintFunction(..) => return reject_operational("print-function"),
             Command::PrintSize(..) => return reject_operational("print-size"),
             Command::Output { .. } => return reject_operational("output"),
-            Command::Sort(..)
-            | Command::Function { .. }
-            | Command::Constructor { .. }
-            | Command::Relation { .. }
-            | Command::Datatype { .. }
-            | Command::Datatypes { .. }
-            | Command::AddRuleset(..)
-            | Command::UnstableCombinedRuleset(..)
-            | Command::Rewrite(_, _, false)
-            | Command::BiRewrite(..)
-            | Command::RunSchedule(..) => {}
+            _ => {}
         }
     }
     Ok(())
+}
+
+fn egglog_error(error: impl ToString) -> MonitorError {
+    MonitorError::Egglog(error.to_string())
 }

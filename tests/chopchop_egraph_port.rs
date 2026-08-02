@@ -6,7 +6,7 @@
 // input, so every assertion below is made at epsilon and after each complete
 // lexeme. See THIRD_PARTY_NOTICES.md for attribution and license text.
 
-use prefixspace::{Grammar, LivePrefixMonitor};
+use prefixspace::{Grammar, Monitor};
 
 const EXPRESSION_YACC: &str = r#"
 %start expr
@@ -300,7 +300,7 @@ fn expression_grammar() -> Grammar {
 }
 
 fn egraph_program(fixture: &str) -> String {
-    format!("{EGRAPH_BASE}\n{fixture}\n(run 100)\n")
+    format!("{EGRAPH_BASE}\n{fixture}\n")
 }
 
 fn assert_lexeme_trace(
@@ -308,27 +308,27 @@ fn assert_lexeme_trace(
     program: &str,
     target: &str,
     source: &str,
-    expected_viable: &[bool],
+    expected_answers: &[Option<bool>],
     case: &str,
 ) {
     let tokens = grammar.lex(source).unwrap();
     assert_eq!(
-        expected_viable.len(),
+        expected_answers.len(),
         tokens.len() + 1,
         "bad expected trace for {case}: {source:?}"
     );
 
-    let mut monitor = LivePrefixMonitor::from_egglog(grammar, program, target)
+    let mut monitor = Monitor::new(grammar, program, target)
         .unwrap_or_else(|error| panic!("could not build {case} monitor: {error}"));
     assert_eq!(
-        !monitor.intersection_is_empty(),
-        expected_viable[0],
+        monitor.realizability(),
+        expected_answers[0],
         "{case}: viability mismatch at epsilon for {source:?}"
     );
 
     for (index, token) in tokens.iter().enumerate() {
         let terminal = grammar.terminal_name(token.kind);
-        let empty = monitor
+        let answer = monitor
             .push_token_name(terminal, &token.lexeme)
             .unwrap_or_else(|error| {
                 panic!(
@@ -337,8 +337,8 @@ fn assert_lexeme_trace(
                 )
             });
         assert_eq!(
-            !empty,
-            expected_viable[index + 1],
+            answer,
+            expected_answers[index + 1],
             "{case}: viability mismatch after lexeme {} ({terminal} {:?}), prefix {:?}",
             index + 1,
             token.lexeme,
@@ -360,7 +360,7 @@ fn assert_all_lexeme_prefixes_viable(
         program,
         target,
         source,
-        &vec![true; token_count + 1],
+        &vec![Some(true); token_count + 1],
         case,
     );
 }
@@ -381,7 +381,7 @@ fn chopchop_static_six_oracle_at_lexeme_boundaries() {
         &program,
         "$six",
         "2 +",
-        &[true, true, false],
+        &[Some(true), Some(true), None],
         "static-six",
     );
     assert_lexeme_trace(
@@ -389,7 +389,7 @@ fn chopchop_static_six_oracle_at_lexeme_boundaries() {
         &program,
         "$six",
         "x +",
-        &[true, true, false],
+        &[Some(true), Some(true), None],
         "static-six",
     );
 }
@@ -408,7 +408,14 @@ fn chopchop_division_oracle_at_lexeme_boundaries() {
         assert_all_lexeme_prefixes_viable(&grammar, &program, "$div", source, "division");
     }
 
-    assert_lexeme_trace(&grammar, &program, "$div", "c", &[true, false], "division");
+    assert_lexeme_trace(
+        &grammar,
+        &program,
+        "$div",
+        "c",
+        &[Some(true), None],
+        "division",
+    );
 }
 
 #[test]

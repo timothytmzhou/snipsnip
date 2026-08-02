@@ -1,6 +1,8 @@
 //! Conversion from the input CFG representation to the expression graph used
 //! by Parsing with Zippers.
 
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
@@ -94,11 +96,19 @@ pub(crate) fn compile<P>(input: &InputGrammar) -> Result<Grammar<P>, GrammarErro
     })
 }
 
+impl<P> TryFrom<&InputGrammar> for Grammar<P> {
+    type Error = GrammarError;
+
+    fn try_from(input: &InputGrammar) -> Result<Self, Self::Error> {
+        compile(input)
+    }
+}
+
 /// Resolves the grammar's symbolic annotations against one semantic backend.
 pub(crate) fn semantics(
     input: &InputGrammar,
     constructor_id: impl Fn(&str) -> ConstructorId,
-    constructors: Vec<ConstructorSchema>,
+    constructors: Arc<[ConstructorSchema]>,
 ) -> Schema {
     let actions = input
         .productions()
@@ -118,7 +128,7 @@ pub(crate) fn semantics(
         .collect::<Vec<_>>();
     Schema {
         actions: actions.into(),
-        constructors: constructors.into(),
+        constructors,
     }
 }
 

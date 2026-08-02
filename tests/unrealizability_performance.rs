@@ -1,175 +1,90 @@
-use prefixspace::{
-    DEFAULT_UNREALIZABILITY_WORK_LIMIT, Grammar, LiveMonitorStats, LivePrefixMonitor,
-};
+use std::time::{Duration, Instant};
 
-fn repeated_statement_grammar() -> Grammar {
+use prefixspace::{Grammar, Monitor};
+
+fn stream_grammar() -> Grammar {
     Grammar::from_yacc(
         r#"
         %start stream
         %token X SEMI END
         %%
         stream: item stream { $1 }
-              | END         { Leaf() }
+              | END         { Wanted() }
               ;
-        item: X SEMI { Leaf() };
+        item: X SEMI { Wanted() };
         "#,
     )
     .unwrap()
 }
 
-fn complete_free_stream(statement_count: usize) -> LiveMonitorStats {
-    let grammar = repeated_statement_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        r#"
-        (datatype Type (Leaf) (Other))
-        (free Type TypeDisjoint)
-        (let $wanted (Leaf))
-        "#,
-        "$wanted",
-        "TypeDisjoint",
-    )
-    .unwrap();
-
-    for _ in 0..statement_count {
-        assert!(!monitor.push_token_name("X", "x").unwrap());
-        assert!(!monitor.push_token_name("SEMI", ";").unwrap());
-        assert_eq!(monitor.realizability(), Some(true));
-    }
-    monitor.stats()
-}
-
-fn focused_managed_stream(statement_count: usize) -> LiveMonitorStats {
-    let grammar = repeated_statement_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog(
-        &grammar,
-        r#"
-        (datatype Type (Leaf) (Other))
-        (let $wanted (Other))
-        "#,
-        "$wanted",
-    )
-    .unwrap();
-    monitor
-        .add_managed_rewrites("(rewrite (Leaf) (Other))")
-        .unwrap();
-
-    for _ in 0..statement_count {
-        assert!(!monitor.push_token_name("X", "x").unwrap());
-        assert!(!monitor.push_token_name("SEMI", ";").unwrap());
-        assert_eq!(monitor.realizability(), Some(true));
-    }
-    monitor.stats()
-}
-
-#[test]
-fn complete_free_ll1_stream_keeps_incremental_overhead_linear() {
-    let small_count = 64;
-    let large_count = 512;
-    let baseline = complete_free_stream(0);
-    let small = complete_free_stream(small_count);
-    let large = complete_free_stream(large_count);
-
-    let small_facts = small.prefix_space_facts - baseline.prefix_space_facts;
-    let large_facts = large.prefix_space_facts - baseline.prefix_space_facts;
-    let small_matches = small.total_delta_rule_matches - baseline.total_delta_rule_matches;
-    let large_matches = large.total_delta_rule_matches - baseline.total_delta_rule_matches;
-    let scale = large_count / small_count + 1;
-
-    assert!(large_facts <= small_facts * scale, "{small:?} {large:?}");
-    assert!(
-        large_matches <= small_matches * scale + 64,
-        "{small:?} {large:?}"
-    );
-    // Repeated Leaf() terms share one private egglog binding.
-    assert_eq!(large.fixed_tree_bindings, 1, "{large:?}");
-    // Complete free structure uses the exact cached zipper/e-class product;
-    // it never invokes the bounded fallback enumerator.
-    assert_eq!(large.total_prefix_output_work, 0, "{large:?}");
-    assert_eq!(large.full_rebuilds, 0);
-}
-
-#[test]
-fn focused_managed_ll1_stream_keeps_prefix_work_linear() {
-    let small_count = 64;
-    let large_count = 512;
-    let baseline = focused_managed_stream(0);
-    let small = focused_managed_stream(small_count);
-    let large = focused_managed_stream(large_count);
-
-    let small_work = small.total_prefix_output_work - baseline.total_prefix_output_work;
-    let large_work = large.total_prefix_output_work - baseline.total_prefix_output_work;
-    let scale = large_count / small_count + 1;
-    assert!(large_work <= small_work * scale, "{small:?} {large:?}");
-    assert_eq!(large.fixed_tree_bindings, 1, "{large:?}");
-    assert_eq!(large.full_rebuilds, 0);
-}
-
-#[test]
-fn partial_disjointness_has_a_hard_per_update_work_bound() {
-    let grammar = repeated_statement_grammar();
-    let mut monitor = LivePrefixMonitor::from_egglog_with_disjointness(
-        &grammar,
-        r#"
-        (datatype Type (Leaf) (Other))
-        (relation TypeDisjoint (Type Type))
-        (TypeDisjoint (Other) (Leaf))
-        (let $wanted (Leaf))
-        "#,
-        "$wanted",
-        "TypeDisjoint",
-    )
-    .unwrap();
-
-    let statement_count = if cfg!(debug_assertions) { 256 } else { 2_500 };
-    for _ in 0..statement_count {
-        monitor.push_token_name("X", "x").unwrap();
-        assert!(monitor.stats().last_prefix_output_work <= DEFAULT_UNREALIZABILITY_WORK_LIMIT);
-        monitor.push_token_name("SEMI", ";").unwrap();
-        assert!(monitor.stats().last_prefix_output_work <= DEFAULT_UNREALIZABILITY_WORK_LIMIT);
-    }
-    assert_eq!(monitor.stats().full_rebuilds, 0);
-}
-
-fn monitor_with_unfocused_free_terms(term_count: usize) -> LivePrefixMonitor {
-    let grammar = Grammar::from_yacc(
-        r#"
-        %start start
-        %token WANTED
-        %%
-        start: WANTED { Wanted() };
-        "#,
-    )
-    .unwrap();
+fn stream_monitor(unrelated_terms: usize, negative: bool) -> Monitor {
+    let grammar = stream_grammar();
     let mut program = String::from(
         r#"
-        (datatype Type (Wanted) (Junk i64))
-        (free Type TypeDisjoint)
-        (let $wanted (Wanted))
+        (datatype Type (Wanted) (Other) (Junk i64))
+        (relation Disjoint (Type Type))
+        (Disjoint (Wanted) (Other))
+        (Disjoint (Other) (Wanted))
         "#,
     );
-    for index in 0..term_count {
-        program.push_str(&format!("(let $unfocused_{index} (Junk {index}))\n"));
+    for value in 0..unrelated_terms {
+        program.push_str(&format!("(Junk {value})\n"));
     }
-    LivePrefixMonitor::from_egglog_with_disjointness(&grammar, &program, "$wanted", "TypeDisjoint")
-        .unwrap()
+    program.push_str(if negative {
+        "(let $target (Other))\n"
+    } else {
+        "(let $target (Wanted))\n"
+    });
+    Monitor::new(&grammar, &program, "$target").unwrap()
+}
+
+fn push_statements(monitor: &mut Monitor, count: usize, expected: Option<bool>) -> Duration {
+    let start = Instant::now();
+    for _ in 0..count {
+        assert_eq!(monitor.push_token_name("X", "x").unwrap(), expected);
+        assert_eq!(monitor.push_token_name("SEMI", ";").unwrap(), expected);
+    }
+    start.elapsed()
+}
+
+fn assert_loosely_bounded(small: Duration, large: Duration, multiplier: u32) {
+    let bound = small
+        .saturating_mul(multiplier)
+        .saturating_add(Duration::from_secs(3));
+    assert!(large <= bound, "small={small:?}, large={large:?}");
 }
 
 #[test]
-fn free_reasoning_does_not_cross_product_a_large_unfocused_egraph() {
-    let small = monitor_with_unfocused_free_terms(16);
-    let large = monitor_with_unfocused_free_terms(if cfg!(debug_assertions) {
-        2_000
-    } else {
-        10_000
-    });
+fn long_ll1_stream_has_linear_black_box_scaling() {
+    let mut small = stream_monitor(0, false);
+    let mut large = stream_monitor(0, false);
 
     assert_eq!(small.realizability(), Some(true));
     assert_eq!(large.realizability(), Some(true));
-    assert!(
-        large.stats().total_delta_rule_matches <= small.stats().total_delta_rule_matches + 8,
-        "small={:?} large={:?}",
-        small.stats(),
-        large.stats()
+    let small_elapsed = push_statements(&mut small, 128, Some(true));
+    let large_elapsed = push_statements(&mut large, 1_024, Some(true));
+
+    assert_eq!(large.realizability(), Some(true));
+    assert_loosely_bounded(small_elapsed, large_elapsed, 24);
+}
+
+#[test]
+fn large_unrelated_egraph_does_not_dominate_streaming_updates() {
+    let mut small = stream_monitor(16, true);
+    let mut large = stream_monitor(
+        if cfg!(debug_assertions) {
+            2_000
+        } else {
+            10_000
+        },
+        true,
     );
+
+    assert_eq!(small.realizability(), Some(false));
+    assert_eq!(large.realizability(), Some(false));
+    let small_elapsed = push_statements(&mut small, 128, Some(false));
+    let large_elapsed = push_statements(&mut large, 128, Some(false));
+
+    assert_eq!(large.realizability(), Some(false));
+    assert_loosely_bounded(small_elapsed, large_elapsed, 8);
 }

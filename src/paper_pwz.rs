@@ -3,9 +3,11 @@
 //!
 //! This module deliberately contains no lexer, grammar analysis, semantic
 //! actions, or backend integration. The maps are the paper's mutable graph;
-//! [`Edit`] reports its new monotone semantic relationships after a derivative.
+//! [`Change`] reports each new monotone semantic relationship after a
+//! derivative.
 
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 
 pub type Terminal = u32;
 pub type GrammarSymbol = u32;
@@ -99,7 +101,7 @@ pub struct Zipper<P> {
 /// A new monotone semantic relationship produced by one derivative. Consumers
 /// read newly named expressions and contexts directly from [`Pwz`]'s maps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Edit {
+pub enum Change {
     NewExpression(ExpressionId),
     NewContext(ContextId),
     MemoParentAppended {
@@ -112,22 +114,18 @@ pub enum Edit {
     },
 }
 
-pub struct Derivative<'a, P> {
-    /// The updated PwZ graph. This lets downstream incremental analyses read
-    /// the graph and its edit slice without copying either one.
-    pub pwz: &'a Pwz<P>,
-    pub zippers: &'a [Zipper<P>],
-    pub edits: &'a [Edit],
-}
+/// Owned changes made by one derivative. Common deterministic derivatives
+/// remain inline and do not allocate.
+pub type Changes = SmallVec<[Change; 16]>;
 
 pub struct Pwz<P> {
     pub expressions: HashMap<ExpressionId, Expression<P>>,
     pub memos: HashMap<MemoId, Memo>,
     pub contexts: HashMap<ContextId, Context<P>>,
 
-    pub(crate) zippers: Vec<Zipper<P>>,
+    zippers: Vec<Zipper<P>>,
     select: HashMap<ExpressionId, Box<[Terminal]>>,
-    edits: Vec<Edit>,
+    changes: Changes,
     position: usize,
     next_expression: u32,
     next_memo: u32,
@@ -201,7 +199,7 @@ impl<P: Clone> Pwz<P> {
             contexts: HashMap::default(),
             zippers: Vec::new(),
             select: grammar.select,
-            edits: Vec::new(),
+            changes: Changes::new(),
             position: 0,
             next_expression,
             next_memo: 0,
@@ -230,14 +228,14 @@ impl<P: Clone> Pwz<P> {
         }
 
         // `new` exposes the initialized maps directly. `derive` reports only
-        // edits made by that derivative.
-        parser.edits.clear();
+        // changes made by that derivative.
+        parser.changes.clear();
         parser
     }
 
     /// Takes one derivative of every current zipper, following Figure 1.
-    pub fn derive(&mut self, token: Token<P>) -> Derivative<'_, P> {
-        self.edits.clear();
+    pub fn derive(&mut self, token: Token<P>) -> Changes {
+        debug_assert!(self.changes.is_empty());
         let current = std::mem::take(&mut self.zippers);
         let mut next = Vec::new();
         let mut operations = current
@@ -269,11 +267,12 @@ impl<P: Clone> Pwz<P> {
             .position
             .checked_add(1)
             .expect("input position space exhausted");
-        Derivative {
-            pwz: self,
-            zippers: &self.zippers,
-            edits: &self.edits,
-        }
+        std::mem::take(&mut self.changes)
+    }
+
+    /// Current zippers after the most recent derivative.
+    pub fn zippers(&self) -> &[Zipper<P>] {
+        &self.zippers
     }
 
     // d↓
@@ -457,7 +456,7 @@ impl<P: Clone> Pwz<P> {
             node,
         };
         assert!(self.expressions.insert(id, value).is_none());
-        self.edits.push(Edit::NewExpression(id));
+        self.changes.push(Change::NewExpression(id));
         id
     }
 
@@ -484,7 +483,7 @@ impl<P: Clone> Pwz<P> {
             .checked_add(1)
             .expect("context ID space exhausted");
         assert!(self.contexts.insert(id, value).is_none());
-        self.edits.push(Edit::NewContext(id));
+        self.changes.push(Change::NewContext(id));
         id
     }
 
@@ -499,7 +498,8 @@ impl<P: Clone> Pwz<P> {
     fn append_parent(&mut self, memo: MemoId, context: ContextId) {
         let value = self.memos.get_mut(&memo).expect("unknown memo ID");
         value.parents.push(context);
-        self.edits.push(Edit::MemoParentAppended { memo, context });
+        self.changes
+            .push(Change::MemoParentAppended { memo, context });
     }
 
     fn set_memo_result(&mut self, memo: MemoId, result: ExpressionId) {
@@ -518,8 +518,8 @@ impl<P: Clone> Pwz<P> {
             panic!("an alternative memo result must be an Alt expression");
         };
         children.push(child);
-        self.edits
-            .push(Edit::AlternativeChildAppended { alternative, child });
+        self.changes
+            .push(Change::AlternativeChildAppended { alternative, child });
     }
 
     fn expression(&self, id: ExpressionId) -> &Expression<P> {
@@ -588,22 +588,28 @@ mod tests {
         Token { terminal, payload }
     }
 
+    fn derive_len(parser: &mut Pwz<Payload>, terminal: u32, payload: Payload) -> usize {
+        parser.derive(input(terminal, payload));
+        parser.zippers().len()
+    }
+
     #[test]
     fn sequence_resumes_at_the_next_token() {
         let mut parser = Pwz::new(grammar(0, [(0, seq(&[1, 2])), (1, tok(A)), (2, tok(B))]));
 
-        let first = parser.derive(input(A, "first-a"));
-        assert_eq!(first.zippers.len(), 1);
+        let first_changes = parser.derive(input(A, "first-a"));
+        assert!(!first_changes.is_empty());
+        assert!(!first_changes.spilled());
+        assert_eq!(parser.zippers().len(), 1);
         assert_eq!(
-            &first.zippers[0].focus,
+            &parser.zippers()[0].focus,
             &ExpressionNode::Seq {
                 symbol: Symbol::Token(input(A, "first-a")),
                 children: Vec::new(),
             }
         );
-        let second = parser.derive(input(B, "second-b"));
-        assert_eq!(second.zippers.len(), 1);
-        assert!(parser.derive(input(C, "miss")).zippers.is_empty());
+        assert_eq!(derive_len(&mut parser, B, "second-b"), 1);
+        assert_eq!(derive_len(&mut parser, C, "miss"), 0);
     }
 
     #[test]
@@ -613,9 +619,9 @@ mod tests {
             [(0, seq(&[1, 2, 3])), (1, tok(A)), (2, tok(B)), (3, tok(C))],
         ));
 
-        assert_eq!(parser.derive(input(A, "a")).zippers.len(), 1);
-        assert_eq!(parser.derive(input(B, "b")).zippers.len(), 1);
-        assert_eq!(parser.derive(input(C, "c")).zippers.len(), 1);
+        assert_eq!(derive_len(&mut parser, A, "a"), 1);
+        assert_eq!(derive_len(&mut parser, B, "b"), 1);
+        assert_eq!(derive_len(&mut parser, C, "c"), 1);
         parser.derive(input(D, "after"));
         let children = parser
             .expressions
@@ -660,9 +666,9 @@ mod tests {
         let mut right = Pwz::new(source.clone());
         let mut miss = Pwz::new(source);
 
-        assert_eq!(left.derive(input(A, "left")).zippers.len(), 1);
-        assert_eq!(right.derive(input(B, "right")).zippers.len(), 1);
-        assert!(miss.derive(input(C, "miss")).zippers.is_empty());
+        assert_eq!(derive_len(&mut left, A, "left"), 1);
+        assert_eq!(derive_len(&mut right, B, "right"), 1);
+        assert_eq!(derive_len(&mut miss, C, "miss"), 0);
     }
 
     #[test]
@@ -682,10 +688,10 @@ mod tests {
         let mut left = Pwz::new(source.clone());
         let mut right = Pwz::new(source);
 
-        assert_eq!(left.derive(input(A, "shared-left")).zippers.len(), 1);
-        assert_eq!(right.derive(input(A, "shared-right")).zippers.len(), 1);
-        assert_eq!(left.derive(input(B, "left")).zippers.len(), 1);
-        assert_eq!(right.derive(input(C, "right")).zippers.len(), 1);
+        assert_eq!(derive_len(&mut left, A, "shared-left"), 1);
+        assert_eq!(derive_len(&mut right, A, "shared-right"), 1);
+        assert_eq!(derive_len(&mut left, B, "left"), 1);
+        assert_eq!(derive_len(&mut right, C, "right"), 1);
     }
 
     #[test]
@@ -701,9 +707,9 @@ mod tests {
             ],
         ));
 
-        assert_eq!(parser.derive(input(B, "base")).zippers.len(), 1);
-        assert_eq!(parser.derive(input(A, "suffix-1")).zippers.len(), 1);
-        assert_eq!(parser.derive(input(A, "suffix-2")).zippers.len(), 1);
+        assert_eq!(derive_len(&mut parser, B, "base"), 1);
+        assert_eq!(derive_len(&mut parser, A, "suffix-1"), 1);
+        assert_eq!(derive_len(&mut parser, A, "suffix-2"), 1);
     }
 
     #[test]
@@ -720,8 +726,8 @@ mod tests {
             ],
         ));
 
-        assert_eq!(parser.derive(input(B, "base")).zippers.len(), 1);
-        assert!(parser.derive(input(A, "miss")).zippers.is_empty());
+        assert_eq!(derive_len(&mut parser, B, "base"), 1);
+        assert_eq!(derive_len(&mut parser, A, "miss"), 0);
     }
 
     #[test]
@@ -739,9 +745,9 @@ mod tests {
         ));
 
         for _ in 0..2_000 {
-            assert_eq!(parser.derive(input(A, "prefix")).zippers.len(), 1);
+            assert_eq!(derive_len(&mut parser, A, "prefix"), 1);
         }
-        assert_eq!(parser.derive(input(B, "base")).zippers.len(), 1);
-        assert!(parser.derive(input(C, "after")).zippers.is_empty());
+        assert_eq!(derive_len(&mut parser, B, "base"), 1);
+        assert_eq!(derive_len(&mut parser, C, "after"), 0);
     }
 }

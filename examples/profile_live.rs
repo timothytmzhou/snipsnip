@@ -1,6 +1,9 @@
 use std::{env, hint::black_box, time::Instant};
 
-use prefixspace::{Grammar, LivePrefixMonitor, PwzRecognizer};
+use prefixspace::{
+    Grammar, Monitor,
+    paper_pwz::{Grammar as PwzGrammar, Pwz, Token as PwzToken},
+};
 
 fn grammar() -> Grammar {
     Grammar::from_yacc(
@@ -39,10 +42,10 @@ const LATE_EGRAPH: &str = r#"
     (let $junk-right (JunkRight))
 "#;
 
-fn setup_monitor(count: usize, program: &str) -> LivePrefixMonitor {
+fn setup_monitor(count: usize, program: &str) -> Monitor {
     let grammar = grammar();
     let terminal = grammar.terminal_by_name("X").unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(&grammar, program, "$root").unwrap();
+    let mut monitor = Monitor::new(&grammar, program, "$root").unwrap();
     for _ in 0..count {
         black_box(monitor.push_lexeme(terminal, "x").unwrap());
     }
@@ -57,9 +60,14 @@ fn main() {
             let started = Instant::now();
             let grammar = grammar();
             let terminal = grammar.terminal_by_name("X").unwrap();
-            let mut parser = PwzRecognizer::compile(&grammar).unwrap();
+            let compiled: PwzGrammar<()> = (&grammar).try_into().unwrap();
+            let mut parser = Pwz::new(compiled);
             for _ in 0..count {
-                black_box(parser.push(terminal).unwrap());
+                parser.derive(PwzToken {
+                    terminal: terminal.index() as u32,
+                    payload: (),
+                });
+                black_box(parser.zippers());
             }
             eprintln!("mode=vanilla count={count} elapsed={:?}", started.elapsed());
         }
@@ -70,12 +78,8 @@ fn main() {
             } else {
                 LIVE_EGRAPH
             };
-            let monitor = setup_monitor(count, program);
-            eprintln!(
-                "mode={mode} count={count} elapsed={:?} stats={:?}",
-                started.elapsed(),
-                monitor.stats()
-            );
+            black_box(setup_monitor(count, program));
+            eprintln!("mode={mode} count={count} elapsed={:?}", started.elapsed());
         }
         "noop" | "unrelated" | "relevant" => {
             let program = if mode == "relevant" {
@@ -85,18 +89,14 @@ fn main() {
             };
             let mut monitor = setup_monitor(count, program);
             let update = match mode.as_str() {
-                "noop" => "(run 1)",
+                "noop" => "(union $nil $nil)",
                 "unrelated" => "(union $junk-left $junk-right)",
                 "relevant" => "(union $nil (Cons $nil))",
                 _ => unreachable!(),
             };
             let started = Instant::now();
             black_box(monitor.run_egglog(update).unwrap());
-            eprintln!(
-                "mode={mode} count={count} elapsed={:?} stats={:?}",
-                started.elapsed(),
-                monitor.stats()
-            );
+            eprintln!("mode={mode} count={count} elapsed={:?}", started.elapsed());
         }
         _ => panic!("mode must be vanilla, forest, live, noop, unrelated, or relevant"),
     }

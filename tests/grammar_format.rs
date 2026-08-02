@@ -145,7 +145,7 @@ fn distinguishes_missing_and_unused_lex_rules() {
 }
 
 #[test]
-fn matches_standard_lex_default_regex_flags_and_rejects_custom_flags() {
+fn uses_the_supported_default_regex_flags_and_rejects_custom_flags() {
     let yacc = r#"
         %start s
         %token A
@@ -166,7 +166,7 @@ fn matches_standard_lex_default_regex_flags_and_rejects_custom_flags() {
 }
 
 #[test]
-fn accepts_punctuated_egglog_constructor_symbols_in_actions() {
+fn accepts_punctuation_in_constructor_names() {
     let grammar = Grammar::from_yacc(
         r#"
         %start s
@@ -211,7 +211,7 @@ fn lexer_memoizes_long_failed_maximal_munch_candidates() {
 }
 
 #[test]
-fn lexer_anchors_restart_at_each_token_boundary_like_lrlex() {
+fn lexer_anchors_restart_at_each_token_boundary() {
     let yacc = r#"
         %start s
         %token A

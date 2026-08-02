@@ -15,7 +15,12 @@ thiserror = "2"
 web-time = "1.1"
 
 [dev-dependencies]
-egglog = { version = "=2.0.0", default-features = false }
+criterion = "0.7"
+egglog = { git = "https://github.com/egraphs-good/egglog", rev = "53b9721b9706741edff2b7c1e379fc37137184d9", default-features = false }
+
+[[bench]]
+name = "typescript"
+harness = false
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }

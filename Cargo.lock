@@ -400,8 +400,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b2e053dcef2cd92b0dee0acfad08d83a98c1c1e55b4c55b8eefa2c0e3f4d055"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "csv",
  "dyn-clone",
@@ -412,15 +411,16 @@ dependencies = [
  "egglog-numeric-id",
  "egglog-reports",
  "egraph-serialize",
+ "enum-map",
  "hashbrown 0.16.1",
  "im-rc",
  "indexmap",
  "log",
  "num",
  "ordered-float",
- "rayon",
  "rustc-hash",
  "serde_json",
+ "smallvec",
  "thiserror",
  "web-time",
 ]
@@ -428,8 +428,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eea7ffb4d889c382918cfa139256f2a4d3f46de6e08d9c071e33543393bd3663"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -438,8 +437,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c67f2aa84cdabd48b266cff0ad4bc6d4cb4386ca51d8c8d93e089f182bc162b"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "ordered-float",
 ]
@@ -447,11 +445,11 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf9e5c5f59f5edb456367dd1e7e30fe5ecfd5b434954ec7ad2d90b3169d9a2f"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "anyhow",
  "dyn-clone",
+ "egglog-concurrency",
  "egglog-core-relations",
  "egglog-numeric-id",
  "egglog-reports",
@@ -462,8 +460,6 @@ dependencies = [
  "num-rational",
  "once_cell",
  "ordered-float",
- "petgraph",
- "rayon",
  "smallvec",
  "thiserror",
  "web-time",
@@ -472,20 +468,19 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5cf71f21545d7b14aceb21e51fdc16b1077e5063df03d57253fc13f098ea2cd"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "arc-swap",
+ "bumpalo",
+ "crossbeam",
  "egglog-numeric-id",
- "rayon",
  "smallvec",
 ]
 
 [[package]]
 name = "egglog-core-relations"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7d477debbbe77c0fb24df98c37560cce6b8dcd8d05918a009926204cbf13c73"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -503,9 +498,7 @@ dependencies = [
  "log",
  "num",
  "once_cell",
- "petgraph",
  "rand",
- "rayon",
  "rustc-hash",
  "smallvec",
  "thiserror",
@@ -515,17 +508,12 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b207a4ee3241bc8c84bb314d8c6802fa4974c4742a9b1af5e7646ec6ddb5ae5"
-dependencies = [
- "rayon",
-]
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 
 [[package]]
 name = "egglog-reports"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03a58e0caea9c3d0fe0486245784f579645576f3b4a8be97fb5828655b281208"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "clap",
  "hashbrown 0.16.1",
@@ -539,8 +527,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175f8e99129dcdac7f96b12cc4703c4145bb74a1a53accc46073a19ace10b9f9"
+source = "git+https://github.com/egraphs-good/egglog?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -563,6 +550,26 @@ name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+
+[[package]]
+name = "enum-map"
+version = "2.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6866f3bfdf8207509a033af1a75a7b08abda06bbaaeae6669323fd5a097df2e9"
+dependencies = [
+ "enum-map-derive",
+]
+
+[[package]]
+name = "enum-map-derive"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f282cfdfe92516eb26c2af8589c274c7c17681f5ecc03c18255fe741c6aa64eb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "equivalent"
@@ -591,12 +598,6 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -676,22 +677,13 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
  "serde",
  "serde_core",
 ]
@@ -1001,18 +993,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
-name = "petgraph"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
-dependencies = [
- "fixedbitset",
- "hashbrown 0.15.5",
- "indexmap",
- "serde",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1081,6 +1061,7 @@ dependencies = [
 name = "prefixspace-web"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "egglog",
  "getrandom",
  "prefixspace",

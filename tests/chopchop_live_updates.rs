@@ -3,7 +3,7 @@
 // (MIT). ChopChop checks characters; this port pushes one complete lexeme at
 // a time. See THIRD_PARTY_NOTICES.md for attribution and license text.
 
-use prefixspace::{Grammar, LivePrefixMonitor};
+use prefixspace::{Grammar, Monitor};
 
 const DECLARATION_YACC: &str = r#"
 %start start
@@ -73,10 +73,10 @@ fn declaration_grammar() -> Grammar {
 
 fn push_one(
     grammar: &Grammar,
-    monitor: &mut LivePrefixMonitor,
+    monitor: &mut Monitor,
     token: &prefixspace::Token,
     source: &str,
-) -> bool {
+) -> Option<bool> {
     let terminal = grammar.terminal_name(token.kind);
     monitor
         .push_token_name(terminal, &token.lexeme)
@@ -89,50 +89,55 @@ fn push_one(
 }
 
 #[test]
-fn union_at_in_keeps_y_body_viable_and_late_union_resurrects_it() {
+fn union_before_or_after_the_final_lexeme_has_the_same_answer() {
     let grammar = declaration_grammar();
     let source = "let y = 6 in y";
     let tokens = grammar.lex(source).unwrap();
 
-    let mut updated_at_in = LivePrefixMonitor::from_egglog(&grammar, Y_AND_SIX, "$root").unwrap();
-    assert!(!updated_at_in.intersection_is_empty());
+    let mut updated_at_in = Monitor::new(&grammar, Y_AND_SIX, "$root").unwrap();
+    assert_eq!(updated_at_in.realizability(), Some(true));
     for token in &tokens {
         let terminal = grammar.terminal_name(token.kind);
-        let empty = push_one(&grammar, &mut updated_at_in, token, source);
-        assert!(
-            !empty,
+        let answer = push_one(&grammar, &mut updated_at_in, token, source);
+        assert_eq!(
+            answer,
+            Some(true),
             "prefix {:?} unexpectedly became empty before the IN update",
             &source[..token.end]
         );
         if terminal == "IN" {
-            assert!(
-                !updated_at_in.run_egglog("(union $y $six)").unwrap(),
+            assert_eq!(
+                updated_at_in.run_egglog("(union $y $six)").unwrap(),
+                Some(true),
                 "the prefix through IN should remain viable after the union"
             );
         }
     }
-    assert!(
-        !updated_at_in.intersection_is_empty(),
-        "Body(Var(\"y\")) should match Body(Num(6)) after the union"
-    );
+    assert_eq!(updated_at_in.realizability(), Some(true));
 
     // The same completed prefix is initially outside the fixed target class.
     // Growing only the e-graph must resurrect it without replaying a lexeme.
-    let mut late_update = LivePrefixMonitor::from_egglog(&grammar, Y_AND_SIX, "$root").unwrap();
+    let mut late_update = Monitor::new(&grammar, Y_AND_SIX, "$root").unwrap();
     for (index, token) in tokens.iter().enumerate() {
-        let empty = push_one(&grammar, &mut late_update, token, source);
+        let answer = push_one(&grammar, &mut late_update, token, source);
         assert_eq!(
-            empty,
-            index + 1 == tokens.len(),
+            answer,
+            if index + 1 == tokens.len() {
+                None
+            } else {
+                Some(true)
+            },
             "unexpected control result after prefix {:?}",
             &source[..token.end]
         );
     }
-    let lexeme_updates = late_update.stats().lexeme_updates;
-    assert!(late_update.intersection_is_empty());
-    assert!(!late_update.run_egglog("(union $y $six)").unwrap());
-    assert_eq!(late_update.stats().lexeme_updates, lexeme_updates);
-    assert!(!late_update.intersection_is_empty());
+    assert_eq!(late_update.realizability(), None);
+    assert_eq!(
+        late_update.run_egglog("(union $y $six)").unwrap(),
+        Some(true)
+    );
+    assert_eq!(late_update.realizability(), Some(true));
+    assert_eq!(updated_at_in.realizability(), late_update.realizability());
 }
 
 #[test]
@@ -140,64 +145,39 @@ fn z_union_matches_the_body_but_a_trailing_plus_has_no_target_completion() {
     let grammar = declaration_grammar();
     let source = "let z = 3 * 2 in z +";
     let tokens = grammar.lex(source).unwrap();
-    let mut monitor = LivePrefixMonitor::from_egglog(&grammar, Z_AND_PRODUCT, "$root").unwrap();
+    let mut monitor = Monitor::new(&grammar, Z_AND_PRODUCT, "$root").unwrap();
 
-    assert!(!monitor.intersection_is_empty());
+    assert_eq!(monitor.realizability(), Some(true));
     for token in &tokens {
         let terminal = grammar.terminal_name(token.kind);
-        let empty = push_one(&grammar, &mut monitor, token, source);
+        let answer = push_one(&grammar, &mut monitor, token, source);
         if terminal == "PLUS" {
-            assert!(
-                empty,
+            assert_eq!(
+                answer, None,
                 "after `z +`, every syntactic completion has an Add root"
             );
         } else {
-            assert!(
-                !empty,
+            assert_eq!(
+                answer,
+                Some(true),
                 "prefix {:?} should still have a target completion",
                 &source[..token.end]
             );
         }
 
         if terminal == "IN" {
-            assert!(!monitor.run_egglog("(union $z $product)").unwrap());
+            assert_eq!(
+                monitor.run_egglog("(union $z $product)").unwrap(),
+                Some(true)
+            );
         }
         if terminal == "ID" && token.lexeme == "z" && token.start > source.find('=').unwrap() {
-            assert!(
-                !monitor.intersection_is_empty(),
+            assert_eq!(
+                monitor.realizability(),
+                Some(true),
                 "the body z should match the product class after the IN update"
             );
         }
     }
-    assert!(monitor.intersection_is_empty());
-}
-
-#[test]
-fn update_before_or_after_the_final_lexeme_has_the_same_answer() {
-    let grammar = declaration_grammar();
-    let source = "let y = 6 in y";
-    let tokens = grammar.lex(source).unwrap();
-
-    let mut early = LivePrefixMonitor::from_egglog(&grammar, Y_AND_SIX, "$root").unwrap();
-    for token in &tokens {
-        let terminal = grammar.terminal_name(token.kind);
-        let _ = push_one(&grammar, &mut early, token, source);
-        if terminal == "IN" {
-            let _ = early.run_egglog("(union $y $six)").unwrap();
-        }
-    }
-
-    let mut late = LivePrefixMonitor::from_egglog(&grammar, Y_AND_SIX, "$root").unwrap();
-    for token in &tokens {
-        let _ = push_one(&grammar, &mut late, token, source);
-    }
-    assert!(late.intersection_is_empty());
-    let _ = late.run_egglog("(union $y $six)").unwrap();
-
-    assert_eq!(
-        early.intersection_is_empty(),
-        late.intersection_is_empty(),
-        "the answer must depend on the final prefix/e-graph pair, not update order"
-    );
-    assert!(!early.intersection_is_empty());
+    assert_eq!(monitor.realizability(), None);
 }
