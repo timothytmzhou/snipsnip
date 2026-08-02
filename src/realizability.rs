@@ -7,7 +7,7 @@
 
 use std::{hash::Hash, sync::Arc};
 
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 
 use crate::{
@@ -353,6 +353,22 @@ impl RealizabilityEngine {
         })
     }
 
+    /// True only when every represented completion has a known whole value
+    /// and the user's `Disjoint` relation separates each value from the
+    /// target. The walk is temporary; no negative facts are retained.
+    pub(crate) fn is_unrealizable(&self, pwz: &Pwz<TokenValues>, egraph: &EgglogBackend) -> bool {
+        if !egraph.has_disjoint_facts() {
+            return false;
+        }
+        let Some(outputs) = DisjointProof::new(self, pwz, egraph).whole_outputs() else {
+            return false;
+        };
+        !outputs.is_empty()
+            && outputs
+                .into_iter()
+                .all(|output| egraph.disjoint(output, egraph.target()))
+    }
+
     /// Inserts only AST fragments already fixed by the consumed prefix. The
     /// resulting classes are ordinary `Produces` facts, so no second concrete
     /// tree store is needed.
@@ -362,12 +378,8 @@ impl RealizabilityEngine {
         expressions: &[ExpressionId],
         egraph: &mut EgglogBackend,
     ) -> Result<bool, MonitorError> {
-        let mut expressions = expressions
-            .iter()
-            .copied()
-            .filter(|id| pwz.expressions[id].fixed)
-            .collect::<Vec<_>>();
-        expressions.sort_unstable_by_key(|id| id.0);
+        let expressions =
+            self.fixed_postorder(pwz, expressions.iter().copied(), &HashSet::default());
 
         for &expression in &expressions {
             self.materialize_expression(pwz, egraph, expression)?;
@@ -404,6 +416,7 @@ impl RealizabilityEngine {
         }
 
         let mut seen = HashSet::default();
+        let mut materialized = HashSet::default();
         let mut relevant = Vec::new();
         while let Some((memo, value, path)) = agenda.pop() {
             if !seen.insert((memo, value)) {
@@ -431,6 +444,14 @@ impl RealizabilityEngine {
                         left,
                         right,
                     } => {
+                        self.materialize_selected_context(
+                            pwz,
+                            egraph,
+                            &symbol,
+                            &left,
+                            &right,
+                            &mut materialized,
+                        )?;
                         for expression in left.iter().chain(&right) {
                             if pwz.expressions[expression].fixed {
                                 relevant.extend(self.closure.produces.values(*expression));
@@ -446,6 +467,97 @@ impl RealizabilityEngine {
             }
         }
         egraph.saturate_near(&relevant)
+    }
+
+    fn materialize_selected_context(
+        &mut self,
+        pwz: &Pwz<TokenValues>,
+        egraph: &mut EgglogBackend,
+        symbol: &Symbol<TokenValues>,
+        left: &[ExpressionId],
+        right: &[ExpressionId],
+        materialized: &mut HashSet<ExpressionId>,
+    ) -> Result<(), MonitorError> {
+        let mut roots = SmallVec::<[ExpressionId; 4]>::new();
+        let mut add = |child| {
+            if let Child::Fixed(expression) = child {
+                roots.push(expression);
+            }
+        };
+        match symbol {
+            Symbol::Token(_) => {}
+            Symbol::Bottom => add(bottom_child(left, right)),
+            Symbol::Grammar(action) => match &self.schema.actions[*action as usize] {
+                SemanticAction::Project { position } => {
+                    add(context_child(left, right, *position));
+                }
+                SemanticAction::Construct { arguments, .. } => {
+                    for &position in arguments.iter() {
+                        add(context_child(left, right, position));
+                    }
+                }
+            },
+        }
+
+        let expressions = self.fixed_postorder(pwz, roots, materialized);
+        for &expression in &expressions {
+            self.materialize_expression(pwz, egraph, expression)?;
+            self.close(pwz, egraph);
+        }
+        materialized.extend(expressions);
+        Ok(())
+    }
+
+    fn fixed_postorder(
+        &self,
+        pwz: &Pwz<TokenValues>,
+        roots: impl IntoIterator<Item = ExpressionId>,
+        skip: &HashSet<ExpressionId>,
+    ) -> Vec<ExpressionId> {
+        let mut pending = roots
+            .into_iter()
+            .map(|expression| (expression, false))
+            .collect::<Vec<_>>();
+        let mut entered = HashSet::default();
+        let mut output = Vec::new();
+        while let Some((expression, expanded)) = pending.pop() {
+            if skip.contains(&expression) || !pwz.expressions[&expression].fixed {
+                continue;
+            }
+            if expanded {
+                output.push(expression);
+                continue;
+            }
+            if !entered.insert(expression) {
+                continue;
+            }
+            pending.push((expression, true));
+            match &pwz.expressions[&expression].node {
+                ExpressionNode::Tok(_) => {}
+                ExpressionNode::Alt { children } => {
+                    pending.extend(children.iter().map(|child| (*child, false)));
+                }
+                ExpressionNode::Seq { symbol, children } => match symbol {
+                    Symbol::Token(_) => {}
+                    Symbol::Bottom => {
+                        pending.extend(children.last().map(|child| (*child, false)));
+                    }
+                    Symbol::Grammar(action) => match &self.schema.actions[*action as usize] {
+                        SemanticAction::Project { position } => {
+                            pending.push((children[*position], false));
+                        }
+                        SemanticAction::Construct { arguments, .. } => {
+                            pending.extend(
+                                arguments
+                                    .iter()
+                                    .map(|position| (children[*position], false)),
+                            );
+                        }
+                    },
+                },
+            }
+        }
+        output
     }
 
     fn materialize_context(
@@ -1287,6 +1399,235 @@ impl RealizabilityEngine {
             self.indexes
                 .consumers_by_constructor
                 .resize_with(len, Vec::new);
+        }
+    }
+}
+
+const MAX_DISJOINT_COMBINATIONS: usize = 4_096;
+
+/// One bounded, read-only proof attempt for the current prefix.
+struct DisjointProof<'a> {
+    engine: &'a RealizabilityEngine,
+    pwz: &'a Pwz<TokenValues>,
+    egraph: &'a EgglogBackend,
+    expressions: HashMap<ExpressionId, Option<Vec<TypedClass<ValueId>>>>,
+    visiting: HashSet<ExpressionId>,
+}
+
+impl<'a> DisjointProof<'a> {
+    fn new(
+        engine: &'a RealizabilityEngine,
+        pwz: &'a Pwz<TokenValues>,
+        egraph: &'a EgglogBackend,
+    ) -> Self {
+        Self {
+            engine,
+            pwz,
+            egraph,
+            expressions: HashMap::default(),
+            visiting: HashSet::default(),
+        }
+    }
+
+    fn whole_outputs(mut self) -> Option<Vec<TypedClass<ValueId>>> {
+        let mut pending = Vec::new();
+        for zipper in self.pwz.zippers() {
+            let values = self.engine.focus_classes(&zipper.focus);
+            if values.is_empty() {
+                pending.push((zipper.memo, None));
+            } else {
+                pending.extend(
+                    values
+                        .into_iter()
+                        .map(|value| (zipper.memo, Some(self.egraph.canonical_class(value)))),
+                );
+            }
+        }
+
+        let mut seen = HashSet::default();
+        let mut outputs = Vec::new();
+        while let Some((memo, hole)) = pending.pop() {
+            let hole = hole.map(|value| self.egraph.canonical_class(value));
+            if !seen.insert((memo, hole)) {
+                continue;
+            }
+            let parents = &self.pwz.memos[&memo].parents;
+            if parents.is_empty() {
+                return None;
+            }
+            for &context in parents {
+                match &self.pwz.contexts[&context] {
+                    Context::Top => {
+                        let value = hole?;
+                        self.push_unique(&mut outputs, value);
+                    }
+                    Context::Alt { memo } => pending.push((*memo, hole)),
+                    Context::Seq {
+                        memo,
+                        symbol,
+                        left,
+                        right,
+                    } => {
+                        let values = self.context_outputs(symbol, left, right, hole)?;
+                        if values.is_empty() {
+                            return None;
+                        }
+                        pending.extend(values.into_iter().map(|value| (*memo, Some(value))));
+                    }
+                }
+            }
+        }
+        (!outputs.is_empty()).then_some(outputs)
+    }
+
+    fn context_outputs(
+        &mut self,
+        symbol: &Symbol<TokenValues>,
+        left: &[ExpressionId],
+        right: &[ExpressionId],
+        hole: Option<TypedClass<ValueId>>,
+    ) -> Option<Vec<TypedClass<ValueId>>> {
+        match symbol {
+            Symbol::Token(_) => None,
+            Symbol::Bottom => self.child_values(bottom_child(left, right), hole),
+            Symbol::Grammar(action) => match &self.engine.schema.actions[*action as usize] {
+                SemanticAction::Project { position } => {
+                    self.child_values(context_child(left, right, *position), hole)
+                }
+                SemanticAction::Construct {
+                    constructor,
+                    arguments,
+                } => {
+                    let children = arguments
+                        .iter()
+                        .map(|position| {
+                            self.child_values(context_child(left, right, *position), hole)
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    self.constructor_outputs(*constructor, children)
+                }
+            },
+        }
+    }
+
+    fn child_values(
+        &mut self,
+        child: Child,
+        hole: Option<TypedClass<ValueId>>,
+    ) -> Option<Vec<TypedClass<ValueId>>> {
+        match child {
+            Child::Hole => Some(hole.into_iter().collect()),
+            Child::Fixed(expression) => self.expression_outputs(expression),
+        }
+    }
+
+    fn expression_outputs(&mut self, expression: ExpressionId) -> Option<Vec<TypedClass<ValueId>>> {
+        if let Some(cached) = self.expressions.get(&expression) {
+            return cached.clone();
+        }
+        if !self.visiting.insert(expression) {
+            return None;
+        }
+
+        let parsed = &self.pwz.expressions[&expression];
+        // Before a negative query, `Monitor::synchronize` materializes every
+        // selected fixed subtree in postorder. Its closed `Produces` rows are
+        // therefore the complete semantic alternatives for this expression.
+        let result = if parsed.fixed {
+            let mut values = Vec::new();
+            for value in self.engine.closure.produces.values(expression) {
+                self.push_unique(&mut values, value);
+            }
+            (!values.is_empty()).then_some(values)
+        } else {
+            match &parsed.node {
+                ExpressionNode::Tok(_) => None,
+                ExpressionNode::Alt { children } => {
+                    let mut values = Vec::new();
+                    for &child in children {
+                        for value in self.expression_outputs(child)? {
+                            self.push_unique(&mut values, value);
+                        }
+                    }
+                    Some(values)
+                }
+                ExpressionNode::Seq { symbol, children } => match symbol {
+                    Symbol::Token(token) => {
+                        let mut values = Vec::new();
+                        for &value in &token.payload {
+                            self.push_unique(&mut values, value);
+                        }
+                        Some(values)
+                    }
+                    Symbol::Bottom => children
+                        .last()
+                        .copied()
+                        .map_or_else(|| Some(Vec::new()), |child| self.expression_outputs(child)),
+                    Symbol::Grammar(action) => {
+                        match &self.engine.schema.actions[*action as usize] {
+                            SemanticAction::Project { position } => {
+                                self.expression_outputs(children[*position])
+                            }
+                            SemanticAction::Construct {
+                                constructor,
+                                arguments,
+                            } => {
+                                let values = arguments
+                                    .iter()
+                                    .map(|position| self.expression_outputs(children[*position]))
+                                    .collect::<Option<Vec<_>>>()?;
+                                self.constructor_outputs(*constructor, values)
+                            }
+                        }
+                    }
+                },
+            }
+        };
+
+        self.visiting.remove(&expression);
+        self.expressions.insert(expression, result.clone());
+        result
+    }
+
+    fn constructor_outputs(
+        &mut self,
+        constructor: ConstructorId,
+        children: Vec<Vec<TypedClass<ValueId>>>,
+    ) -> Option<Vec<TypedClass<ValueId>>> {
+        let schema = &self.engine.schema.constructors[constructor];
+        if children.len() != schema.inputs.len() {
+            return None;
+        }
+        let mut choices = Vec::with_capacity(children.len());
+        for (values, &sort) in children.into_iter().zip(&schema.inputs) {
+            let mut matching = Vec::new();
+            for value in values.into_iter().filter(|value| value.sort == sort) {
+                self.push_unique(&mut matching, value);
+            }
+            if matching.is_empty() {
+                return None;
+            }
+            choices.push(matching);
+        }
+
+        let combinations = choices
+            .iter()
+            .try_fold(1usize, |count, row| count.checked_mul(row.len()))?;
+        if combinations > MAX_DISJOINT_COMBINATIONS {
+            return None;
+        }
+        let mut outputs = Vec::new();
+        for children in products(&choices) {
+            let output = self.egraph.existing_application(constructor, &children)?;
+            self.push_unique(&mut outputs, output);
+        }
+        Some(outputs)
+    }
+
+    fn push_unique(&self, values: &mut Vec<TypedClass<ValueId>>, value: TypedClass<ValueId>) {
+        let value = self.egraph.canonical_class(value);
+        if !values.contains(&value) {
+            values.push(value);
         }
     }
 }

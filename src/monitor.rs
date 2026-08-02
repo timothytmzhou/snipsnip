@@ -39,7 +39,7 @@ impl Monitor {
             realizability,
             backend: init.backend,
         };
-        if monitor.realizability() != Some(true) {
+        if monitor.realizability().is_none() {
             monitor.synchronize(&[])?;
         }
         Ok(monitor)
@@ -98,7 +98,7 @@ impl Monitor {
         if self.parser.zippers().is_empty() {
             return Ok(Some(false));
         }
-        if self.realizability() == Some(true) {
+        if self.has_witness() {
             return Ok(Some(true));
         }
         let fixed = changes
@@ -133,11 +133,13 @@ impl Monitor {
     pub fn realizability(&self) -> Option<bool> {
         if self.parser.zippers().is_empty() {
             Some(false)
+        } else if self.has_witness() {
+            Some(true)
         } else if self
             .realizability
-            .is_realizable(&self.parser, &self.backend)
+            .is_unrealizable(&self.parser, &self.backend)
         {
-            Some(true)
+            Some(false)
         } else {
             None
         }
@@ -146,8 +148,8 @@ impl Monitor {
     fn finish_egraph_update(&mut self) -> Result<Option<bool>, MonitorError> {
         let delta = self.backend.flush_changes()?;
         self.apply_delta(delta);
-        if self.realizability() == Some(true) {
-            return Ok(Some(true));
+        if let Some(answer) = self.realizability() {
+            return Ok(Some(answer));
         }
         self.synchronize(&[])?;
         Ok(self.realizability())
@@ -158,7 +160,7 @@ impl Monitor {
         self.materialize(new_fixed)?;
         let delta = self.backend.flush_changes()?;
         self.apply_delta(delta);
-        if self.realizability() == Some(true) {
+        if self.realizability().is_some() {
             return Ok(());
         }
 
@@ -167,7 +169,7 @@ impl Monitor {
             let updated = delta.updated;
             let changed_intersection = !delta.changes.is_empty();
             self.apply_delta(delta);
-            if self.realizability() == Some(true) {
+            if self.realizability().is_some() {
                 return Ok(());
             }
 
@@ -175,7 +177,7 @@ impl Monitor {
                 let focus_changed = self.materialize(&[])?;
                 let delta = self.backend.flush_changes()?;
                 self.apply_delta(delta);
-                if self.realizability() == Some(true) {
+                if self.realizability().is_some() {
                     return Ok(());
                 }
                 if focus_changed {
@@ -201,6 +203,11 @@ impl Monitor {
             .realizability
             .materialize_focus(&self.parser, &mut self.backend)?;
         Ok(fixed || focus)
+    }
+
+    fn has_witness(&self) -> bool {
+        self.realizability
+            .is_realizable(&self.parser, &self.backend)
     }
 }
 

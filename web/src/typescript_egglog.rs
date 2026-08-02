@@ -107,11 +107,12 @@ pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
 (rewrite (Modulo (BooleanExpression) other) (ExpressionError))
 (rewrite (Modulo other (BooleanExpression)) (ExpressionError))
 
-;; Relational results. TypeScript accepts two operands in the same primitive
-;; domain here, including boolean/boolean, and rejects mixed domains.
+;; Relational results. This subset accepts number/number and string/string;
+;; TypeScript rejects boolean operands and mixed primitive domains.
 (birewrite (LessThan (NumberExpression) (NumberExpression)) (BooleanExpression))
 (birewrite (LessThan (StringExpression) (StringExpression)) (BooleanExpression))
-(birewrite (LessThan (BooleanExpression) (BooleanExpression)) (BooleanExpression))
+(rewrite (LessThan (BooleanExpression) other) (ExpressionError))
+(rewrite (LessThan other (BooleanExpression)) (ExpressionError))
 (rewrite (LessThan (NumberExpression) (StringExpression)) (ExpressionError))
 (rewrite (LessThan (StringExpression) (NumberExpression)) (ExpressionError))
 (rewrite (LessThan (NumberExpression) (BooleanExpression)) (ExpressionError))

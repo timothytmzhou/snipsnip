@@ -50,7 +50,6 @@ fn concrete_valid_ast_terms_rewrite_to_accept() {
         "(Analyze (LetDeclaration (NumberAnnotation) (NumberLiteral)))",
         "(Analyze (LetDeclaration (StringAnnotation) (Add (TrueLiteral) (StringLiteral))))",
         "(Analyze (LetDeclaration (NumberAnnotation) (Property (StringLiteral) \"length\")))",
-        "(Analyze (LetDeclaration (BooleanAnnotation) (LessThan (TrueLiteral) (FalseLiteral))))",
         "(Analyze (LetDeclaration (NumberAnnotation) (Call (Identifier \"Number\") (Call (Identifier \"Number\") (NumberLiteral)))))",
     ] {
         assert_eq!(classify(term), Some(Classification::Accept), "{term}");
@@ -61,6 +60,7 @@ fn concrete_valid_ast_terms_rewrite_to_accept() {
 fn concrete_invalid_ast_terms_rewrite_to_reject() {
     for term in [
         "(Analyze (LetDeclaration (NumberAnnotation) (TrueLiteral)))",
+        "(Analyze (LetDeclaration (BooleanAnnotation) (LessThan (TrueLiteral) (FalseLiteral))))",
         "(Analyze (LetDeclaration (BooleanAnnotation) (LessThan (NumberLiteral) (StringLiteral))))",
         "(Analyze (LetDeclaration (NumberAnnotation) (Property (NumberLiteral) \"length\")))",
         "(Analyze (LetDeclaration (NumberAnnotation) (Property (StringLiteral) \"missing\")))",

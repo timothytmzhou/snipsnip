@@ -180,8 +180,8 @@ impl Scheduler for FocusScheduler {
             let Some(relevant_class) = relevant_class else {
                 continue;
             };
-            let count = state.selected.entry((rule.id, relevant_class)).or_default();
-            if *count == MAX_MATCHES_PER_RULE_AND_CLASS {
+            let key = (rule.id, relevant_class);
+            if state.selected.get(&key).copied().unwrap_or(0) == MAX_MATCHES_PER_RULE_AND_CLASS {
                 continue;
             }
             if selected == MATCH_BATCH {
@@ -189,7 +189,7 @@ impl Scheduler for FocusScheduler {
                 continue;
             }
             matches.choose(index);
-            *count += 1;
+            *state.selected.entry(key).or_default() += 1;
             selected += 1;
         }
         state.deferred |= deferred;
@@ -227,6 +227,7 @@ pub(crate) struct EgglogBackend {
     scheduler: SchedulerId,
     intersection_stale: bool,
     pending: Vec<EGraphChange>,
+    disjoint_relation: bool,
 }
 
 impl EgglogBackend {
@@ -244,6 +245,7 @@ impl EgglogBackend {
         if let Some(error) = run.error {
             return Err(error);
         }
+        let disjoint_relation = run.disjoint_relation_added;
         let rules = run.rules;
 
         let target_expression = binding_expression(&mut egraph, target_binding)?;
@@ -306,10 +308,12 @@ impl EgglogBackend {
             scheduler,
             intersection_stale: false,
             pending: Vec::new(),
+            disjoint_relation,
         };
         backend.install_rules(rules);
         backend.rebuild_target_focus();
         backend.begin_focus();
+        backend.validate_disjoint()?;
         Ok(BackendInit { backend, schema })
     }
 
@@ -432,6 +436,69 @@ impl EgglogBackend {
                 == self.canonical(&self.sorts[right.sort].sort, right.class.raw())
     }
 
+    pub(crate) fn canonical_class(&self, value: TypedClass<ValueId>) -> TypedClass<ValueId> {
+        TypedClass {
+            sort: value.sort,
+            class: ValueId(self.canonical(&self.sorts[value.sort].sort, value.class.raw())),
+        }
+    }
+
+    pub(crate) fn has_disjoint_facts(&self) -> bool {
+        self.disjoint_relation
+            && self
+                .egraph
+                .read(|state| state.table_size("Disjoint"))
+                .unwrap_or(0)
+                != 0
+    }
+
+    pub(crate) fn disjoint(&self, left: TypedClass<ValueId>, right: TypedClass<ValueId>) -> bool {
+        if !self.disjoint_relation {
+            return false;
+        }
+        if left.sort != self.target.sort_id || right.sort != self.target.sort_id {
+            return false;
+        }
+        let sort = &self.sorts[self.target.sort_id].sort;
+        let left = self.canonical(sort, left.class.raw());
+        let right = self.canonical(sort, right.class.raw());
+        let contains = |first, second| {
+            self.egraph
+                .read(|state| state.contains("Disjoint", RawValues(vec![first, second])))
+                .unwrap_or(false)
+        };
+        contains(left, right) || contains(right, left)
+    }
+
+    pub(crate) fn existing_application(
+        &self,
+        constructor: ConstructorId,
+        children: &[TypedClass<ValueId>],
+    ) -> Option<TypedClass<ValueId>> {
+        let schema = &self.constructor_schemas[constructor];
+        if children.len() != schema.inputs.len()
+            || children
+                .iter()
+                .zip(&schema.inputs)
+                .any(|(child, sort)| child.sort != *sort)
+        {
+            return None;
+        }
+        let raw = children
+            .iter()
+            .zip(&schema.inputs)
+            .map(|(child, sort)| self.canonical(&self.sorts[*sort].sort, child.class.raw()))
+            .collect::<Vec<_>>();
+        let value = self
+            .egraph
+            .read(|state| state.eclass_of(&self.constructors[constructor].name, RawValues(raw)))
+            .expect("grammar actions were validated as constructors")?;
+        Some(TypedClass {
+            sort: schema.output,
+            class: ValueId(self.canonical(&self.sorts[schema.output].sort, value)),
+        })
+    }
+
     pub(crate) fn add_application(
         &mut self,
         constructor: ConstructorId,
@@ -510,6 +577,7 @@ impl EgglogBackend {
     pub(crate) fn saturate_local(&mut self) -> Result<BackendDelta, MonitorError> {
         let (updated, deferred) = self.step_focused_rules()?;
         if updated {
+            self.validate_disjoint()?;
             self.intersection_stale = true;
             if self.recanonicalize_focus() {
                 self.mark_all();
@@ -544,6 +612,9 @@ impl EgglogBackend {
             self.target.value = target;
             self.mark(EGraphChange::Target);
         }
+        if !self.pending.is_empty() {
+            self.validate_disjoint()?;
+        }
         Ok(BackendDelta {
             changes: std::mem::take(&mut self.pending),
             updated: false,
@@ -562,6 +633,7 @@ impl EgglogBackend {
         let commands = without_schedules(commands);
         let focus = self.schedule.read().unwrap().focus.clone();
         let run = run_commands(&mut self.egraph, commands, Some(&focus));
+        self.disjoint_relation |= run.disjoint_relation_added;
         let relevant_union = run.relevant_union;
         self.install_rules(run.rules);
         let focus_changed = self.recanonicalize_focus();
@@ -569,6 +641,7 @@ impl EgglogBackend {
             self.rebuild_target_focus();
             self.mark_all();
         }
+        self.validate_disjoint()?;
         Ok(match run.error {
             None => MutationResult::Applied,
             Some(error) => MutationResult::PartiallyApplied(error),
@@ -764,6 +837,41 @@ impl EgglogBackend {
         self.egraph.class_id_to_value(&class)
     }
 
+    fn validate_disjoint(&self) -> Result<(), MonitorError> {
+        let Some(function) = self.egraph.get_function("Disjoint") else {
+            return Ok(());
+        };
+        let schema = function.schema();
+        let target_sort = &self.sorts[self.target.sort_id].sort;
+        if !self.disjoint_relation
+            || !valid_disjoint_inputs(schema, target_sort)
+            || self
+                .egraph
+                .constructor_enodes_while("Disjoint", |_| false)
+                .is_err()
+        {
+            return Err(MonitorError::InvalidDisjointRelation {
+                relation: "Disjoint".to_owned(),
+                sort: target_sort.name().to_owned(),
+            });
+        }
+        let mut reflexive = false;
+        self.egraph
+            .constructor_enodes_while("Disjoint", |row| {
+                if row.children.len() == 2 {
+                    reflexive = self.canonical(target_sort, row.children[0])
+                        == self.canonical(target_sort, row.children[1]);
+                }
+                !reflexive
+            })
+            .map_err(egglog_error)?;
+        if reflexive {
+            Err(MonitorError::ReflexiveDisjoint)
+        } else {
+            Ok(())
+        }
+    }
+
     fn mark_all(&mut self) {
         self.mark(EGraphChange::Target);
         for constructor in 0..self.constructors.len() {
@@ -785,6 +893,14 @@ impl EgglogBackend {
     }
 }
 
+fn valid_disjoint_inputs(schema: &egglog::ResolvedSchema, target_sort: &ArcSort) -> bool {
+    schema.input.len() == 2
+        && schema
+            .input
+            .iter()
+            .all(|sort| sort.name() == target_sort.name())
+}
+
 #[derive(Clone)]
 struct ResolvedRulePlan {
     name: String,
@@ -795,6 +911,7 @@ struct ResolvedRulePlan {
 struct CommandRun {
     rules: Vec<ResolvedRulePlan>,
     relevant_union: bool,
+    disjoint_relation_added: bool,
     error: Option<MonitorError>,
 }
 
@@ -805,19 +922,26 @@ fn run_commands(
 ) -> CommandRun {
     let mut plans = Vec::new();
     let mut relevant_union = false;
+    let mut disjoint_relation_added = false;
     for command in commands.into_iter().flat_map(directed_rewrites) {
         relevant_union |= focus.is_some_and(|focus| union_touches_focus(egraph, &command, focus));
         let scheduled = match command {
             Command::Rewrite(_, rewrite, false) => compile_rewrite(egraph, rewrite),
             Command::Rule { .. } => vec![(command, SelectorSpec::Global, None)],
             _ => {
+                let is_disjoint_relation = matches!(
+                    &command,
+                    Command::Relation { name, .. } if name == "Disjoint"
+                );
                 if let Err(error) = egraph.run_program(vec![command]).map_err(egglog_error) {
                     return CommandRun {
                         rules: plans,
                         relevant_union,
+                        disjoint_relation_added,
                         error: Some(error),
                     };
                 }
+                disjoint_relation_added |= is_disjoint_relation;
                 continue;
             }
         };
@@ -838,6 +962,7 @@ fn run_commands(
                     return CommandRun {
                         rules: plans,
                         relevant_union,
+                        disjoint_relation_added,
                         error: Some(error),
                     };
                 }
@@ -847,6 +972,7 @@ fn run_commands(
     CommandRun {
         rules: plans,
         relevant_union,
+        disjoint_relation_added,
         error: None,
     }
 }

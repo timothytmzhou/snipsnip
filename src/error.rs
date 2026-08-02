@@ -8,10 +8,10 @@ pub enum MonitorError {
     Grammar(#[from] GrammarError),
     #[error("egglog update failed: {0}")]
     Egglog(String),
-    #[error("unknown disjointness relation `{0}`")]
-    UnknownDisjointRelation(String),
     #[error("disjointness relation `{relation}` must have signature ({sort} {sort}) -> Unit")]
     InvalidDisjointRelation { relation: String, sort: String },
+    #[error("disjointness relation `Disjoint` is irreflexive, but contains an equal pair")]
+    ReflexiveDisjoint,
     #[error("unknown terminal `{0}`")]
     UnknownTerminal(String),
     #[error("terminal id {0} is outside this monitor grammar's terminal range")]

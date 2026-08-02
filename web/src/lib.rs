@@ -204,7 +204,7 @@ impl TypeScriptAnalyzer {
             .zip(&spans[session.tokens.len()..])
         {
             let token_started = Instant::now();
-            session.monitor.push_token(token)?;
+            let realizability = session.monitor.push_token(token)?;
             let elapsed_ms = milliseconds(token_started);
             session.tokens.push(CachedToken {
                 kind: token.kind,
@@ -214,11 +214,16 @@ impl TypeScriptAnalyzer {
                     start,
                     end,
                     elapsed_ms,
-                    realizability: session.monitor.realizability().into(),
+                    realizability: realizability.into(),
                 },
             });
         }
 
+        let realizability = session
+            .tokens
+            .last()
+            .map(|token| token.analysis.realizability)
+            .unwrap_or_else(|| session.monitor.realizability().into());
         let report = AnalysisReport {
             tokens: session
                 .tokens
@@ -232,7 +237,7 @@ impl TypeScriptAnalyzer {
                     .count(),
                 end: source.encode_utf16().count(),
             }),
-            realizability: session.monitor.realizability().into(),
+            realizability,
             total_ms: milliseconds(total_started),
             incremental: had_previous_analysis && extends_previous,
         };

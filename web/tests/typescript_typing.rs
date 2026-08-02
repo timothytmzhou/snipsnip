@@ -105,7 +105,6 @@ fn operators_are_typed_compositionally() {
         "let answer: number = 5 + 16;",
         "let answer: number = 17 + 12 * 8;",
         "let answer: boolean = 17 + 12 * 8 < 114;",
-        "let answer: boolean = true < false;",
         "let answer: string = \"count: \" + 5;",
         "let answer: string = 5 + \" items\";",
         "let answer: string = true + \"!\";",
@@ -126,6 +125,7 @@ fn operators_are_typed_compositionally() {
 
     for source in [
         "let answer: number = 5 + true;",
+        "let answer: boolean = true < false;",
         "let answer: number = \"five\" + 1;",
         "let answer: number = (1).length;",
         "let answer: boolean = 1 < \"2\";",
@@ -217,5 +217,27 @@ fn thousands_of_nested_number_calls_remain_realizable_at_every_complete_lexeme()
             .iter()
             .all(|token| token.realizability == RealizabilityState::Realizable),
         "every recorded prefix ends at a complete lexer token"
+    );
+}
+
+#[test]
+fn a_deep_invalid_typescript_term_still_gets_a_definite_answer() {
+    let depth = 4_096;
+    let mut source = String::from("let answer: string = ");
+    for _ in 0..depth {
+        source.push_str("Number(");
+    }
+    source.push('0');
+    for _ in 0..depth {
+        source.push(')');
+    }
+    source.push(';');
+
+    let report = analyze(&source);
+    assert_eq!(report.tokens.len(), 3 * depth + 7);
+    assert_eq!(report.realizability, RealizabilityState::Unrealizable);
+    assert_eq!(
+        report.tokens.last().unwrap().realizability,
+        RealizabilityState::Unrealizable
     );
 }
