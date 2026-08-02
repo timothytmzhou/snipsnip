@@ -118,3 +118,29 @@ fn construction_and_lexeme_errors_remain_typed() {
             if terminal == "ID" && lexeme == "123"
     ));
 }
+
+#[test]
+fn failed_batch_lexing_does_not_partially_derive() {
+    let grammar = Grammar::from_yacc_lex(
+        r#"
+        %start start
+        %token ID STRING
+        %%
+        start: ID { Var(1) };
+        "#,
+        r#"%%
+[a-z]+ 'ID'
+\"[^\"]*\" 'STRING'
+[ \t\r\n]+ ;
+"#,
+    )
+    .unwrap();
+    let mut monitor = Monitor::new(&grammar, PROGRAM, "$root").unwrap();
+
+    assert!(monitor.push_complete_text("x \"").is_err());
+    assert_eq!(
+        monitor.push_token_name("ID", "x").unwrap(),
+        Some(true),
+        "the failed batch must not have advanced PwZ past the complete ID"
+    );
+}

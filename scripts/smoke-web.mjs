@@ -41,6 +41,18 @@ if (!valid.tokens.every((token) => token.elapsedMs >= 0)) {
   throw new Error("the token trace did not include timings");
 }
 
+const partial = JSON.parse(
+  analyzer.analyze("let answer: numb"),
+);
+if (partial.pending?.lexeme !== "numb") {
+  throw new Error(
+    `the core lexer did not retain the incomplete suffix: ${JSON.stringify(partial)}`,
+  );
+}
+if (partial.tokens.some((token) => token.lexeme === "numb")) {
+  throw new Error("an incomplete suffix reached the parser token trace");
+}
+
 const withoutNumberTyping = defaultProgram.replace(
   "(birewrite (NumberLiteral) (NumberExpression))",
   "",

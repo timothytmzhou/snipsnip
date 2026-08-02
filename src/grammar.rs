@@ -608,6 +608,30 @@ impl Grammar {
         lex_with_machine(machine, input).map_err(|error| GrammarError::Lex(error.to_string()))
     }
 
+    /// Lexes the part of `input` whose token boundaries are already fixed.
+    ///
+    /// The returned suffix is still a possible prefix of a longer emitted
+    /// lexeme. It must not be sent to a parser yet: for example, an
+    /// identifier-like `numb` may become the keyword `number` after more input
+    /// arrives. A delimiter fixes the preceding boundary, while punctuation
+    /// that no rule can extend is returned immediately. Ignored rules are
+    /// buffered too, because a longer rule may still supersede them.
+    pub fn lex_prefix<'a>(&self, input: &'a str) -> Result<(Vec<Token>, &'a str), GrammarError> {
+        let machine = self.lexer.as_ref().ok_or(GrammarError::NoLexer)?;
+        if machine
+            .rules
+            .iter()
+            .any(|rule| rule.unicode_fallback.is_some())
+        {
+            return Err(GrammarError::UnsupportedLexFeature(
+                "streaming prefix lexing with Unicode word-boundary rules".to_owned(),
+            ));
+        }
+        let (tokens, pending_start) = lex_prefix_with_machine(machine, input)
+            .map_err(|error| GrammarError::Lex(error.to_string()))?;
+        Ok((tokens, &input[pending_start..]))
+    }
+
     pub(crate) fn runtime_input(&self) -> RuntimeInput {
         RuntimeInput {
             terminal_by_name: self.terminal_by_name.clone(),
@@ -827,20 +851,230 @@ fn lex_with_machine(machine: &LexMachine, input: &str) -> Result<Vec<Token>, Lex
     Ok(output)
 }
 
+fn lex_prefix_with_machine(
+    machine: &LexMachine,
+    input: &str,
+) -> Result<(Vec<Token>, usize), LexError> {
+    let mut output = Vec::new();
+    let mut memo = (0..machine.rules.len())
+        .map(|_| HashMap::<(usize, StateID), RuleResult>::new())
+        .collect::<Vec<_>>();
+    let input_is_ascii = input.is_ascii();
+    let mut offset = 0;
+    while offset < input.len() {
+        let mut best = None;
+        let mut can_extend = false;
+        let mut best_is_stable = true;
+        for (rule_index, rule) in machine.rules.iter().enumerate() {
+            let prefix = rule_result(
+                rule,
+                input,
+                input_is_ascii,
+                offset,
+                &mut memo[rule_index],
+                true,
+            )?;
+            if let Some(candidate) = prefix.end.map(|end| LexMatch {
+                end,
+                rule: rule_index,
+            }) {
+                let winner = better_match(best, Some(candidate));
+                if winner == Some(candidate) {
+                    best_is_stable = prefix.stable;
+                }
+                best = winner;
+            }
+            can_extend |= prefix.can_extend;
+        }
+
+        // Maximal munch has not fixed this boundary while any rule can still
+        // grow into a longer match, or while the current winner only exists
+        // because this snapshot ends here (for example, `a$`).
+        let unresolved = can_extend
+            || best.is_some_and(|LexMatch { end, .. }| end == input.len() && !best_is_stable);
+        if unresolved {
+            return Ok((output, offset));
+        }
+
+        let Some(best) = best else {
+            return Err(LexError::NoMatch { offset });
+        };
+        let rule = &machine.rules[best.rule];
+        if best.end == offset {
+            return Err(LexError::ZeroLengthRule {
+                offset,
+                rule: rule.source.clone(),
+            });
+        }
+        if let Some(kind) = rule.terminal {
+            output.push(Token {
+                kind,
+                lexeme: input[offset..best.end].to_owned(),
+                start: offset,
+                end: best.end,
+            });
+        }
+        offset = best.end;
+    }
+    Ok((output, offset))
+}
+
+#[derive(Clone, Copy)]
+struct RuleResult {
+    end: Option<usize>,
+    can_extend: bool,
+    stable: bool,
+}
+
+fn rule_result(
+    rule: &LexRule,
+    input: &str,
+    input_is_ascii: bool,
+    offset: usize,
+    memo: &mut HashMap<(usize, StateID), RuleResult>,
+    inspect_boundary: bool,
+) -> Result<RuleResult, LexError> {
+    if !input_is_ascii && let Some(regex) = &rule.unicode_fallback {
+        return Ok(RuleResult {
+            end: regex.find(&input[offset..]).map(|matched| {
+                debug_assert_eq!(matched.start(), 0);
+                offset + matched.end()
+            }),
+            can_extend: false,
+            stable: true,
+        });
+    }
+
+    let bytes = input.as_bytes();
+    let start_input = Input::new(&bytes[offset..]).anchored(Anchored::Yes);
+    let mut state = rule
+        .dfa
+        .start_state_forward(&start_input)
+        .map_err(|error| LexError::Engine {
+            offset,
+            reason: error.to_string(),
+        })?;
+    let mut position = offset;
+    let mut path = Vec::new();
+
+    let mut result = loop {
+        if let Some(cached) = memo.get(&(position, state)) {
+            break *cached;
+        }
+        if position == bytes.len() {
+            let eoi = rule.dfa.next_eoi_state(state);
+            let quit = rule.dfa.is_quit_state(eoi);
+            let matched = !quit && rule.dfa.is_match_state(eoi);
+            break RuleResult {
+                end: matched.then_some(position),
+                can_extend: inspect_boundary && (quit || dfa_can_match_longer(&rule.dfa, state)),
+                stable: !inspect_boundary || !matched || dfa_match_is_stable(&rule.dfa, state),
+            };
+        }
+
+        let next = rule.dfa.next_state(state, bytes[position]);
+        if rule.dfa.is_quit_state(next) {
+            return Err(LexError::Engine {
+                offset: position,
+                reason: format!("DFA quit on byte {}", bytes[position]),
+            });
+        }
+        let matched = rule.dfa.is_match_state(next).then_some(position);
+        path.push(((position, state), matched));
+        if rule.dfa.is_dead_state(next) {
+            break RuleResult {
+                end: None,
+                can_extend: false,
+                stable: true,
+            };
+        }
+        position += 1;
+        state = next;
+    };
+
+    let retain_path = path.len() >= 256 || !memo.is_empty();
+    while let Some((key, matched)) = path.pop() {
+        if result.end.is_none() && matched.is_some() {
+            result.end = matched;
+            result.stable = true;
+        }
+        if retain_path {
+            memo.insert(key, result);
+        }
+    }
+    Ok(result)
+}
+
+fn dfa_match_is_stable(dfa: &dense::DFA<Vec<u32>>, state: StateID) -> bool {
+    representative_bytes(dfa).all(|byte| {
+        let next = dfa.next_state(state, byte);
+        !dfa.is_quit_state(next) && dfa.is_match_state(next)
+    })
+}
+
+/// Whether a rule can still consume past the current buffer. Match states are
+/// delayed by one transition, so the first transition may merely report a
+/// match ending at the current boundary. Looking one transition beyond it
+/// distinguishes fixed punctuation from an open token. Treating any live
+/// continuation as pending is conservative: it can delay a token, but cannot
+/// send an unfinished token to the parser.
+fn dfa_can_match_longer(dfa: &dense::DFA<Vec<u32>>, state: StateID) -> bool {
+    let mut seen = HashSet::default();
+    for first in representative_bytes(dfa) {
+        let after_first = dfa.next_state(state, first);
+        if dfa.is_quit_state(after_first) {
+            return true;
+        }
+        if dfa.is_dead_state(after_first) {
+            continue;
+        }
+        if !seen.insert(after_first) {
+            continue;
+        }
+        if dfa.is_match_state(dfa.next_eoi_state(after_first)) {
+            return true;
+        }
+        for second in representative_bytes(dfa) {
+            let after_second = dfa.next_state(after_first, second);
+            if dfa.is_quit_state(after_second) {
+                return true;
+            }
+            if !dfa.is_dead_state(after_second) || dfa.is_match_state(after_second) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn representative_bytes(dfa: &dense::DFA<Vec<u32>>) -> impl Iterator<Item = u8> + '_ {
+    dfa.byte_classes()
+        .representatives(..)
+        .filter_map(|unit| unit.as_u8())
+}
+
 fn scan_with_machine(
     machine: &LexMachine,
     input: &str,
     mut emit: impl FnMut(TerminalId, &str, usize, usize),
 ) -> Result<(), LexError> {
     let mut memo = (0..machine.rules.len())
-        .map(|_| HashMap::<(usize, StateID), Option<usize>>::new())
+        .map(|_| HashMap::<(usize, StateID), RuleResult>::new())
         .collect::<Vec<_>>();
     let input_is_ascii = input.is_ascii();
     let mut offset = 0;
     while offset < input.len() {
         let mut best = None;
         for (rule_index, rule) in machine.rules.iter().enumerate() {
-            let Some(end) = rule_match(rule, input, input_is_ascii, offset, &mut memo[rule_index])?
+            let Some(end) = rule_result(
+                rule,
+                input,
+                input_is_ascii,
+                offset,
+                &mut memo[rule_index],
+                false,
+            )?
+            .end
             else {
                 continue;
             };
@@ -871,84 +1105,10 @@ fn scan_with_machine(
     Ok(())
 }
 
-fn rule_match(
-    rule: &LexRule,
-    input: &str,
-    input_is_ascii: bool,
-    offset: usize,
-    memo: &mut HashMap<(usize, StateID), Option<usize>>,
-) -> Result<Option<usize>, LexError> {
-    if !input_is_ascii && let Some(regex) = &rule.unicode_fallback {
-        let suffix = &input[offset..];
-        return Ok(regex.find(suffix).map(|matched| {
-            debug_assert_eq!(matched.start(), 0);
-            offset + matched.end()
-        }));
-    }
-    dfa_rule_match(rule, input.as_bytes(), offset, memo)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LexMatch {
     end: usize,
     rule: usize,
-}
-
-fn dfa_rule_match(
-    rule: &LexRule,
-    input: &[u8],
-    offset: usize,
-    memo: &mut HashMap<(usize, StateID), Option<usize>>,
-) -> Result<Option<usize>, LexError> {
-    // lrlex applies each anchored regex to `&input[offset..]`, so BOI and
-    // word-boundary context restart at every token boundary.
-    let start_input = Input::new(&input[offset..]).anchored(Anchored::Yes);
-    let mut state = rule
-        .dfa
-        .start_state_forward(&start_input)
-        .map_err(|error| LexError::Engine {
-            offset,
-            reason: error.to_string(),
-        })?;
-    let mut position = offset;
-    let mut path = Vec::<((usize, StateID), Option<usize>)>::new();
-
-    let mut result = loop {
-        if let Some(cached) = memo.get(&(position, state)) {
-            break *cached;
-        }
-        if position == input.len() {
-            let state = rule.dfa.next_eoi_state(state);
-            break rule.dfa.is_match_state(state).then_some(position);
-        }
-
-        let next = rule.dfa.next_state(state, input[position]);
-        let matched = rule.dfa.is_match_state(next).then_some(position);
-        path.push(((position, state), matched));
-        if rule.dfa.is_dead_state(next) {
-            break None;
-        }
-        if rule.dfa.is_quit_state(next) {
-            return Err(LexError::Engine {
-                offset: position,
-                reason: format!("DFA quit on byte {}", input[position]),
-            });
-        }
-        position += 1;
-        state = next;
-    };
-
-    let retain_path = path.len() >= 256 || !memo.is_empty();
-    while let Some((key, matched)) = path.pop() {
-        // This mirrors regex-automata's leftmost search: retain the most
-        // recent match unless no later transition matched. Greedy, lazy, and
-        // ordered-alternation priority are encoded in the DFA.
-        result = result.or(matched);
-        if retain_path {
-            memo.insert(key, result);
-        }
-    }
-    Ok(result)
 }
 
 fn better_match(left: Option<LexMatch>, right: Option<LexMatch>) -> Option<LexMatch> {

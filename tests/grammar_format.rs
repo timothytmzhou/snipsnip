@@ -50,6 +50,143 @@ fn lexer_uses_longest_match_then_rule_priority_and_skips_ignores() {
 }
 
 #[test]
+fn prefix_lexer_holds_only_the_unconfirmed_trailing_lexeme() {
+    let grammar = Grammar::from_yacc_lex(
+        r#"
+        %start s
+        %token NUMBER_TYPE IDENT STRING SEMI
+        %%
+        s: NUMBER_TYPE SEMI { Type() }
+         | IDENT SEMI       { Name(1) }
+         | STRING SEMI      { Text() }
+         ;
+        "#,
+        r#"%%
+number                 'NUMBER_TYPE'
+[a-z]+                 'IDENT'
+\"[^\"]*\"             'STRING'
+;                      'SEMI'
+[ \t\r\n]+             ;
+"#,
+    )
+    .unwrap();
+
+    let (tokens, pending) = grammar.lex_prefix("numb").unwrap();
+    assert!(tokens.is_empty());
+    assert_eq!(pending, "numb");
+
+    // Even the complete keyword is not fixed until maximal munch knows that
+    // it will not grow into an identifier such as `numbers`.
+    let (tokens, pending) = grammar.lex_prefix("number").unwrap();
+    assert!(tokens.is_empty());
+    assert_eq!(pending, "number");
+
+    let (tokens, pending) = grammar.lex_prefix("number ;").unwrap();
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|token| grammar.terminal_name(token.kind))
+            .collect::<Vec<_>>(),
+        ["NUMBER_TYPE", "SEMI"]
+    );
+    assert_eq!(pending, "");
+
+    let (tokens, pending) = grammar.lex_prefix("name ").unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(grammar.terminal_name(tokens[0].kind), "IDENT");
+    assert_eq!(pending, " ");
+
+    let (tokens, pending) = grammar.lex_prefix("\"unfinished").unwrap();
+    assert!(tokens.is_empty());
+    assert_eq!(pending, "\"unfinished");
+
+    let (tokens, pending) = grammar.lex_prefix("\"finished\"").unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(grammar.terminal_name(tokens[0].kind), "STRING");
+    assert_eq!(pending, "");
+}
+
+#[test]
+fn prefix_lexer_detects_extensions_longer_than_one_byte() {
+    let grammar = Grammar::from_yacc_lex(
+        r#"
+        %start s
+        %token A SEMI
+        %%
+        s: A SEMI { Done() };
+        "#,
+        "%%\na(bc)* 'A'\n; 'SEMI'\n",
+    )
+    .unwrap();
+
+    let (tokens, pending) = grammar.lex_prefix("a").unwrap();
+    assert!(tokens.is_empty());
+    assert_eq!(pending, "a");
+
+    let (tokens, pending) = grammar.lex_prefix("a;").unwrap();
+    assert_eq!(tokens.len(), 2);
+    assert_eq!(pending, "");
+}
+
+#[test]
+fn prefix_lexer_retains_an_unfinished_ignored_lexeme() {
+    let grammar = Grammar::from_yacc_lex(
+        r#"
+        %start s
+        %token B
+        %%
+        s: B { Done() };
+        "#,
+        "%%\nab ;\na ;\nb 'B'\n",
+    )
+    .unwrap();
+
+    let (tokens, pending) = grammar.lex_prefix("a").unwrap();
+    assert!(tokens.is_empty());
+    assert_eq!(pending, "a");
+    assert!(grammar.lex("ab").unwrap().is_empty());
+}
+
+#[test]
+fn prefix_lexer_does_not_commit_an_eoi_dependent_match() {
+    let grammar = Grammar::from_yacc_lex(
+        r#"
+        %start s
+        %token A
+        %%
+        s: A { Done() };
+        "#,
+        "%%\na$ 'A'\n",
+    )
+    .unwrap();
+
+    let (tokens, pending) = grammar.lex_prefix("a").unwrap();
+    assert!(tokens.is_empty());
+    assert_eq!(pending, "a");
+}
+
+#[test]
+fn prefix_lexer_explicitly_rejects_unicode_word_boundary_fallback() {
+    let grammar = Grammar::from_yacc_lex(
+        r#"
+        %start s
+        %token WORD SEMI
+        %%
+        s: WORD SEMI { Done() };
+        "#,
+        "%%\n\\bβγ 'WORD'\n; 'SEMI'\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        grammar.lex_prefix("β"),
+        Err(GrammarError::UnsupportedLexFeature(feature))
+            if feature.contains("Unicode word-boundary")
+    ));
+    assert_eq!(grammar.lex("βγ;").unwrap().len(), 2);
+}
+
+#[test]
 fn rejects_non_linear_or_non_increasing_actions() {
     let duplicate = r#"
         %start s

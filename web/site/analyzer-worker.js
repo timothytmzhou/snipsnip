@@ -27,6 +27,11 @@
  *
  *   {
  *     realizability: "realizable" | "unrealizable" | "unknown",
+ *     pending: null | {
+ *       lexeme: string,
+ *       start: number,
+ *       end: number
+ *     },
  *     tokens: Array<{
  *       terminal: string,
  *       lexeme: string,

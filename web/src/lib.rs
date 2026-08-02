@@ -106,8 +106,19 @@ pub struct TokenAnalysis {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingLexeme {
+    pub lexeme: String,
+    /// UTF-16 code-unit offset into the source.
+    pub start: usize,
+    /// Exclusive UTF-16 code-unit offset into the source.
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AnalysisReport {
     pub tokens: Vec<TokenAnalysis>,
+    pub pending: Option<PendingLexeme>,
     pub realizability: RealizabilityState,
     pub total_ms: f64,
     pub incremental: bool,
@@ -156,15 +167,16 @@ impl TypeScriptAnalyzer {
         })
     }
 
-    /// Analyzes exactly `source`. The caller is responsible for withholding a
-    /// trailing incomplete lexeme.
+    /// Analyzes the confirmed-lexeme prefix of `source`. A trailing lexeme
+    /// which maximal munch could still extend is returned as `pending` and is
+    /// never sent to the parser.
     ///
     /// If its token stream extends the preceding successful analysis, only
     /// the new tokens are pushed into the retained monitor. Otherwise a fresh
     /// monitor is built from the configured egglog program.
     pub fn analyze(&mut self, source: &str) -> Result<AnalysisReport, AnalyzerError> {
         let total_started = Instant::now();
-        let tokens = self.grammar.lex(source)?;
+        let (tokens, pending) = self.grammar.lex_prefix(source)?;
         let spans = utf16_spans(source, &tokens);
         let had_previous_analysis = self.has_analyzed;
         let previous = self.session.take();
@@ -213,6 +225,13 @@ impl TypeScriptAnalyzer {
                 .iter()
                 .map(|token| token.analysis.clone())
                 .collect(),
+            pending: (!pending.is_empty()).then(|| PendingLexeme {
+                lexeme: pending.to_owned(),
+                start: source[..source.len() - pending.len()]
+                    .encode_utf16()
+                    .count(),
+                end: source.encode_utf16().count(),
+            }),
             realizability: session.monitor.realizability().into(),
             total_ms: milliseconds(total_started),
             incremental: had_previous_analysis && extends_previous,
@@ -372,8 +391,9 @@ mod tests {
                 .iter()
                 .map(|token| token.terminal.as_str())
                 .collect::<Vec<_>>(),
-            ["LET", "IDENT", "COLON", "NUMBER_TYPE", "EQ", "NUM"]
+            ["LET", "IDENT", "COLON", "NUMBER_TYPE", "EQ"]
         );
+        assert_eq!(report.pending.as_ref().unwrap().lexeme, "42");
         assert!(
             report
                 .tokens
@@ -461,6 +481,33 @@ mod tests {
         assert!(json["tokens"][0]["elapsedMs"].is_number());
         assert_eq!(json["tokens"][0]["start"], 0);
         assert_eq!(json["tokens"][0]["end"], 3);
+        assert_eq!(json["pending"]["lexeme"], "1");
+    }
+
+    #[test]
+    fn incomplete_trailing_lexemes_never_reach_the_monitor() {
+        let mut analyzer = TypeScriptAnalyzer::new(DEFAULT_EGGLOG_PROGRAM).unwrap();
+
+        let partial_keyword = analyzer.analyze("let x: numb").unwrap();
+        assert_eq!(partial_keyword.pending.as_ref().unwrap().lexeme, "numb");
+        assert_eq!(partial_keyword.tokens.last().unwrap().terminal, "COLON");
+        assert_eq!(
+            partial_keyword.realizability,
+            RealizabilityState::Realizable,
+            "deriving `numb` as IDENT would kill this parser state"
+        );
+
+        let completed = analyzer.analyze("let x: number ").unwrap();
+        assert!(completed.incremental);
+        assert_eq!(completed.tokens.last().unwrap().terminal, "NUMBER_TYPE");
+
+        let open_string = analyzer.analyze("let x: string = \"unterminated").unwrap();
+        assert_eq!(
+            open_string.pending.as_ref().unwrap().lexeme,
+            "\"unterminated"
+        );
+        assert_eq!(open_string.tokens.last().unwrap().terminal, "EQ");
+        assert_eq!(open_string.realizability, RealizabilityState::Realizable);
     }
 
     #[test]

@@ -1,6 +1,5 @@
 const VALID_SAMPLE = "let answer: number = 42;";
 const INVALID_SAMPLE = "let answer: number = true;";
-const KEYWORDS = ["let", "number", "string", "boolean", "true", "false", "length"];
 const INPUT_DEBOUNCE_MS = 300;
 
 const programInput = document.querySelector("#egglog-program");
@@ -158,19 +157,17 @@ function submitAnalysis(version) {
   }
 
   const source = sourceInput.value;
-  const pending = trailingPendingLexeme(source);
-  const analyzedSource = pending ? source.slice(0, pending.start) : source;
   const id = nextRequestId++;
 
   latestRequestId = id;
-  requests.set(id, { version, source, analyzedSource, pending });
+  requests.set(id, { version, source });
   pruneOldRequests(id);
 
   worker.postMessage({
     type: "analyze",
     id,
     program: programInput.value,
-    source: analyzedSource,
+    source,
   });
 }
 
@@ -190,17 +187,19 @@ function loadSample(source) {
 function renderResult(rawResult, request) {
   const result = rawResult && typeof rawResult === "object" ? rawResult : {};
   const tokens = Array.isArray(result.tokens) ? result.tokens : [];
+  const pending =
+    result.pending && typeof result.pending === "object" ? result.pending : null;
   const fragment = document.createDocumentFragment();
 
   for (const token of tokens) {
     fragment.append(createToken(token, request.source));
   }
 
-  if (request.pending) {
-    fragment.append(createPendingToken(request.pending));
+  if (pending) {
+    fragment.append(createPendingToken(pending));
   }
 
-  if (tokens.length === 0 && !request.pending) {
+  if (tokens.length === 0 && !pending) {
     const empty = document.createElement("div");
     empty.className = "token-empty";
     empty.textContent = "No lexemes yet · showing the result for ε";
@@ -212,9 +211,9 @@ function renderResult(rawResult, request) {
   const elapsed = finiteNumber(result.totalMs) ?? finiteNumber(result.workerMs);
   totalTime.textContent = formatDuration(elapsed);
 
-  if (request.pending) {
+  if (pending) {
     setStatus("unknown", "Unknown · incomplete lexeme");
-    traceHint.textContent = `${request.pending.label} is held outside the parser until it is complete.`;
+    traceHint.textContent = "The incomplete lexeme is held outside the parser until it is complete.";
   } else {
     const status = normalizeRealizability(result.realizability);
     setStatus(status, statusLabelFor(status));
@@ -259,104 +258,23 @@ function createToken(rawToken, source) {
 }
 
 function createPendingToken(pending) {
+  const lexeme = String(pending.lexeme ?? "");
   const button = document.createElement("button");
   button.type = "button";
   button.className = "token token-pending";
-  button.title = pending.label;
-  button.setAttribute("aria-label", `${visibleLexeme(pending.lexeme)}, ${pending.label}`);
+  button.title = "Incomplete lexeme";
+  button.setAttribute("aria-label", `${visibleLexeme(lexeme)}, incomplete lexeme`);
 
-  const lexeme = document.createElement("span");
-  lexeme.className = "token-lexeme";
-  lexeme.textContent = visibleLexeme(pending.lexeme);
+  const lexemeElement = document.createElement("span");
+  lexemeElement.className = "token-lexeme";
+  lexemeElement.textContent = visibleLexeme(lexeme);
 
   const meta = document.createElement("span");
   meta.className = "token-meta";
   meta.textContent = "pending";
 
-  button.append(lexeme, meta);
+  button.append(lexemeElement, meta);
   return button;
-}
-
-function trailingPendingLexeme(source) {
-  const openString = findOpenString(source);
-  if (openString !== null) {
-    return {
-      start: openString,
-      end: source.length,
-      lexeme: source.slice(openString),
-      label: "Unterminated string literal",
-    };
-  }
-
-  const identifier = source.match(/[A-Za-z_][A-Za-z0-9_]*$/u);
-  if (!identifier) return null;
-
-  const lexeme = identifier[0];
-  const start = source.length - lexeme.length;
-  const keyword = KEYWORDS.find(
-    (candidate) =>
-      candidate !== lexeme &&
-      candidate.startsWith(lexeme) &&
-      keywordContextMatches(source, start, candidate),
-  );
-  if (!keyword) return null;
-
-  return {
-    start,
-    end: source.length,
-    lexeme,
-    label: `Incomplete keyword · expected “${keyword}”`,
-  };
-}
-
-function keywordContextMatches(source, start, keyword) {
-  const before = source.slice(0, start).trimEnd();
-
-  // These positions come from the fixed demo grammar, not from generic
-  // identifier spelling. In particular, `let t` is a complete IDENT and must
-  // not be held merely because `t` is a prefix of `true`:
-  //
-  //   `l`, ` le`             -> pending `let`
-  //   `let x: numb`          -> pending `number`
-  //   `let x: number = tr`   -> pending `true`
-  //   `let x: number = "x".le` -> pending `length`
-  //   `let t`, `const n`     -> ordinary identifiers, never pending
-  if (keyword === "let") return before.length === 0;
-  if (["number", "string", "boolean"].includes(keyword)) return before.endsWith(":");
-  if (["true", "false"].includes(keyword)) {
-    return /(?:=|\(|\+|-|\*|\/|%|<)\s*$/u.test(before);
-  }
-  if (keyword === "length") return before.endsWith(".");
-  return false;
-}
-
-function findOpenString(source) {
-  let quote = null;
-  let quoteStart = null;
-  let escaped = false;
-
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index];
-
-    if (quote !== null) {
-      if (escaped) {
-        escaped = false;
-      } else if (character === "\\") {
-        escaped = true;
-      } else if (character === quote) {
-        quote = null;
-        quoteStart = null;
-      }
-      continue;
-    }
-
-    if (character === '"' || character === "'") {
-      quote = character;
-      quoteStart = index;
-    }
-  }
-
-  return quote === null ? null : quoteStart;
 }
 
 function normalizeRealizability(value) {
