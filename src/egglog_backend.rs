@@ -392,7 +392,8 @@ impl EgglogBackend {
         let name = self.constructors[constructor].name.clone();
         let raw = children
             .iter()
-            .map(|child| child.class.raw())
+            .zip(&schema.inputs)
+            .map(|(child, sort)| self.canonical(&self.sorts[*sort].sort, child.class.raw()))
             .collect::<Vec<_>>();
         if let Some(value) = self
             .egraph

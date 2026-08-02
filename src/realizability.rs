@@ -458,7 +458,7 @@ impl RealizabilityEngine {
     ) -> Result<Vec<TypedClass<ValueId>>, MonitorError> {
         let action = match symbol {
             Symbol::Bottom => SemanticAction::Project {
-                position: left.len(),
+                position: left.len() + right.len(),
             },
             Symbol::Grammar(action) => self.schema.actions[*action as usize].clone(),
             Symbol::Token(_) => return Ok(Vec::new()),
@@ -477,7 +477,9 @@ impl RealizabilityEngine {
                     let values = self.context_values(left, right, hole, position);
                     let mut row = Vec::new();
                     for value in values {
-                        if value.sort == schema.inputs[argument] && !row.contains(&value) {
+                        if value.sort == schema.inputs[argument]
+                            && !row.iter().any(|known| egraph.equivalent(*known, value))
+                        {
                             row.push(value);
                         }
                     }
@@ -579,7 +581,9 @@ impl RealizabilityEngine {
         for (argument, &position) in arguments.iter().enumerate() {
             let mut row = Vec::new();
             for value in self.closure.produces.values(children[position]) {
-                if value.sort == schema.inputs[argument] && !row.contains(&value) {
+                if value.sort == schema.inputs[argument]
+                    && !row.iter().any(|known| egraph.equivalent(*known, value))
+                {
                     row.push(value);
                 }
             }
@@ -751,7 +755,7 @@ impl RealizabilityEngine {
         match symbol {
             Symbol::Token(_) => {}
             Symbol::Bottom => {
-                if let Child::Fixed(expression) = context_child(left, right, 1) {
+                if let Child::Fixed(expression) = bottom_child(left, right) {
                     self.indexes
                         .consumers_by_expression
                         .push(expression.0, Consumer::Context(context));
@@ -919,7 +923,7 @@ impl RealizabilityEngine {
         match symbol {
             Symbol::Token(_) => {}
             Symbol::Bottom => {
-                if matches!(context_child(&left, &right, 1), Child::Fixed(id) if id == expression)
+                if matches!(bottom_child(&left, &right), Child::Fixed(id) if id == expression)
                     && demands
                         .iter()
                         .any(|demand| egraph.equivalent(*demand, value))
@@ -993,7 +997,7 @@ impl RealizabilityEngine {
                 Symbol::Bottom => self.propagate_project_context_demand(
                     egraph,
                     context,
-                    context_child(&left, &right, 1),
+                    bottom_child(&left, &right),
                     demand,
                 ),
                 Symbol::Grammar(action) => match self.schema.actions[action as usize].clone() {
@@ -1301,6 +1305,11 @@ fn context_child(left: &[ExpressionId], right: &[ExpressionId], position: usize)
     } else {
         Child::Fixed(right[position - left.len() - 1])
     }
+}
+
+fn bottom_child(left: &[ExpressionId], right: &[ExpressionId]) -> Child {
+    debug_assert_eq!(left.len() + right.len() + 1, 2);
+    context_child(left, right, left.len() + right.len())
 }
 
 fn products<C: Copy>(choices: &[Vec<TypedClass<C>>]) -> Vec<Vec<TypedClass<C>>> {
