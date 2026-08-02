@@ -39,6 +39,10 @@ pub struct ContextId(pub u32);
 pub struct Grammar<P> {
     pub root: ExpressionId,
     pub expressions: HashMap<ExpressionId, ExpressionNode<P>>,
+    /// Optional production SELECT sets used only to avoid entering branches
+    /// which cannot consume the current terminal. Missing entries mean no
+    /// pruning, preserving the paper's general expression interface.
+    pub select: HashMap<ExpressionId, Box<[Terminal]>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +60,9 @@ pub enum ExpressionNode<P> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Expression<P> {
     pub memo: Option<MemoId>,
+    /// False for the cyclic grammar graph; true for a parse fragment fixed by
+    /// the consumed prefix.
+    pub fixed: bool,
     pub node: ExpressionNode<P>,
 }
 
@@ -106,6 +113,9 @@ pub enum Edit {
 }
 
 pub struct Derivative<'a, P> {
+    /// The updated PwZ graph. This lets downstream incremental analyses read
+    /// the graph and its edit slice without copying either one.
+    pub pwz: &'a Pwz<P>,
     pub zippers: &'a [Zipper<P>],
     pub edits: &'a [Edit],
 }
@@ -115,12 +125,32 @@ pub struct Pwz<P> {
     pub memos: HashMap<MemoId, Memo>,
     pub contexts: HashMap<ContextId, Context<P>>,
 
-    zippers: Vec<Zipper<P>>,
+    pub(crate) zippers: Vec<Zipper<P>>,
+    select: HashMap<ExpressionId, Box<[Terminal]>>,
     edits: Vec<Edit>,
     position: usize,
     next_expression: u32,
     next_memo: u32,
     next_context: u32,
+}
+
+enum Operation<P> {
+    Down {
+        context: ContextId,
+        expression: ExpressionId,
+    },
+    DownFresh {
+        memo: MemoId,
+        node: ExpressionNode<P>,
+    },
+    Up {
+        node: ExpressionNode<P>,
+        memo: MemoId,
+    },
+    UpContext {
+        expression: ExpressionId,
+        context: ContextId,
+    },
 }
 
 impl<P: Clone> Pwz<P> {
@@ -129,6 +159,10 @@ impl<P: Clone> Pwz<P> {
         assert!(
             grammar.expressions.contains_key(&grammar.root),
             "grammar root is absent from the expression map"
+        );
+        let root_has_completion = !matches!(
+            grammar.expressions.get(&grammar.root),
+            Some(ExpressionNode::Alt { children }) if children.is_empty()
         );
         for node in grammar.expressions.values() {
             for child in node.children() {
@@ -150,13 +184,23 @@ impl<P: Clone> Pwz<P> {
         let expressions = grammar
             .expressions
             .into_iter()
-            .map(|(id, node)| (id, Expression { memo: None, node }))
+            .map(|(id, node)| {
+                (
+                    id,
+                    Expression {
+                        memo: None,
+                        fixed: false,
+                        node,
+                    },
+                )
+            })
             .collect();
         let mut parser = Self {
             expressions,
             memos: HashMap::default(),
             contexts: HashMap::default(),
             zippers: Vec::new(),
+            select: grammar.select,
             edits: Vec::new(),
             position: 0,
             next_expression,
@@ -175,13 +219,15 @@ impl<P: Clone> Pwz<P> {
         });
         let initial_memo = parser.insert_memo(None);
         parser.append_parent(initial_memo, initial_context);
-        parser.zippers.push(Zipper {
-            focus: ExpressionNode::Seq {
-                symbol: Symbol::Bottom,
-                children: Vec::new(),
-            },
-            memo: initial_memo,
-        });
+        if root_has_completion {
+            parser.zippers.push(Zipper {
+                focus: ExpressionNode::Seq {
+                    symbol: Symbol::Bottom,
+                    children: Vec::new(),
+                },
+                memo: initial_memo,
+            });
+        }
 
         // `new` exposes the initialized maps directly. `derive` reports only
         // edits made by that derivative.
@@ -194,8 +240,29 @@ impl<P: Clone> Pwz<P> {
         self.edits.clear();
         let current = std::mem::take(&mut self.zippers);
         let mut next = Vec::new();
-        for zipper in current {
-            self.up(zipper.focus, zipper.memo, &token, &mut next);
+        let mut operations = current
+            .into_iter()
+            .rev()
+            .map(|zipper| Operation::Up {
+                node: zipper.focus,
+                memo: zipper.memo,
+            })
+            .collect::<Vec<_>>();
+        while let Some(operation) = operations.pop() {
+            match operation {
+                Operation::Down {
+                    context,
+                    expression,
+                } => self.down(context, expression, &mut operations),
+                Operation::DownFresh { memo, node } => {
+                    self.down_fresh(memo, node, &token, &mut next, &mut operations)
+                }
+                Operation::Up { node, memo } => self.up(node, memo, &mut operations),
+                Operation::UpContext {
+                    expression,
+                    context,
+                } => self.up_context(expression, context, &mut operations),
+            }
         }
         self.zippers = next;
         self.position = self
@@ -203,6 +270,7 @@ impl<P: Clone> Pwz<P> {
             .checked_add(1)
             .expect("input position space exhausted");
         Derivative {
+            pwz: self,
             zippers: &self.zippers,
             edits: &self.edits,
         }
@@ -213,8 +281,7 @@ impl<P: Clone> Pwz<P> {
         &mut self,
         context: ContextId,
         expression: ExpressionId,
-        token: &Token<P>,
-        output: &mut Vec<Zipper<P>>,
+        operations: &mut Vec<Operation<P>>,
     ) {
         let current_memo = self.expression(expression).memo;
         if let Some(memo) =
@@ -226,7 +293,10 @@ impl<P: Clone> Pwz<P> {
                     .memo(memo)
                     .result
                     .expect("a completed memo has a result expression");
-                self.up_context(result, context, token, output);
+                operations.push(Operation::UpContext {
+                    expression: result,
+                    context,
+                });
             }
             return;
         }
@@ -235,7 +305,7 @@ impl<P: Clone> Pwz<P> {
         self.append_parent(memo, context);
         self.set_expression_memo(expression, memo);
         let node = self.expression(expression).node.clone();
-        self.down_fresh(memo, node, token, output);
+        operations.push(Operation::DownFresh { memo, node });
     }
 
     // d₀↓
@@ -245,6 +315,7 @@ impl<P: Clone> Pwz<P> {
         node: ExpressionNode<P>,
         token: &Token<P>,
         output: &mut Vec<Zipper<P>>,
+        operations: &mut Vec<Operation<P>>,
     ) {
         match node {
             ExpressionNode::Tok(expected) => {
@@ -260,15 +331,13 @@ impl<P: Clone> Pwz<P> {
             }
             ExpressionNode::Seq { symbol, children } => {
                 let Some((&first, right)) = children.split_first() else {
-                    self.up(
-                        ExpressionNode::Seq {
+                    operations.push(Operation::Up {
+                        node: ExpressionNode::Seq {
                             symbol,
                             children: Vec::new(),
                         },
                         memo,
-                        token,
-                        output,
-                    );
+                    });
                     return;
                 };
 
@@ -281,30 +350,40 @@ impl<P: Clone> Pwz<P> {
                     left: Vec::new(),
                     right: right.to_vec(),
                 });
-                self.down(sequence, first, token, output);
+                operations.push(Operation::Down {
+                    context: sequence,
+                    expression: first,
+                });
             }
             ExpressionNode::Alt { children } => {
                 let alternative = self.insert_context(Context::Alt { memo });
-                for child in children {
-                    self.down(alternative, child, token, output);
+                for child in children.into_iter().rev() {
+                    if self
+                        .select
+                        .get(&child)
+                        .is_some_and(|terminals| terminals.binary_search(&token.terminal).is_err())
+                    {
+                        continue;
+                    }
+                    operations.push(Operation::Down {
+                        context: alternative,
+                        expression: child,
+                    });
                 }
             }
         }
     }
 
     // d↑
-    fn up(
-        &mut self,
-        node: ExpressionNode<P>,
-        memo: MemoId,
-        token: &Token<P>,
-        output: &mut Vec<Zipper<P>>,
-    ) {
+    fn up(&mut self, node: ExpressionNode<P>, memo: MemoId, operations: &mut Vec<Operation<P>>) {
         let expression = self.insert_expression(node);
         self.set_memo_result(memo, expression);
         let parents = self.memo(memo).parents.clone();
-        for context in parents {
-            self.up_context(expression, context, token, output);
+        for context in parents.into_iter().rev() {
+            operations.push(Operation::UpContext {
+                expression,
+                context,
+            });
         }
     }
 
@@ -313,8 +392,7 @@ impl<P: Clone> Pwz<P> {
         &mut self,
         expression: ExpressionId,
         context: ContextId,
-        token: &Token<P>,
-        output: &mut Vec<Zipper<P>>,
+        operations: &mut Vec<Operation<P>>,
     ) {
         match self.context(context).clone() {
             Context::Top => {}
@@ -326,15 +404,13 @@ impl<P: Clone> Pwz<P> {
             } => {
                 let Some((&next, rest)) = right.split_first() else {
                     left.push(expression);
-                    self.up(
-                        ExpressionNode::Seq {
+                    operations.push(Operation::Up {
+                        node: ExpressionNode::Seq {
                             symbol,
                             children: left,
                         },
                         memo,
-                        token,
-                        output,
-                    );
+                    });
                     return;
                 };
 
@@ -345,7 +421,10 @@ impl<P: Clone> Pwz<P> {
                     left,
                     right: rest.to_vec(),
                 });
-                self.down(next_context, next, token, output);
+                operations.push(Operation::Down {
+                    context: next_context,
+                    expression: next,
+                });
             }
             Context::Alt { memo } => {
                 if self.memo(memo).end == Some(self.position) {
@@ -355,14 +434,12 @@ impl<P: Clone> Pwz<P> {
                         .expect("a completed alternative memo has a result");
                     self.append_alternative_child(alternative, expression);
                 } else {
-                    self.up(
-                        ExpressionNode::Alt {
+                    operations.push(Operation::Up {
+                        node: ExpressionNode::Alt {
                             children: vec![expression],
                         },
                         memo,
-                        token,
-                        output,
-                    );
+                    });
                 }
             }
         }
@@ -374,7 +451,11 @@ impl<P: Clone> Pwz<P> {
             .next_expression
             .checked_add(1)
             .expect("expression ID space exhausted");
-        let value = Expression { memo: None, node };
+        let value = Expression {
+            memo: None,
+            fixed: true,
+            node,
+        };
         assert!(self.expressions.insert(id, value).is_none());
         self.edits.push(Edit::NewExpression(id));
         id
@@ -482,6 +563,7 @@ mod tests {
         Grammar {
             root: E(root),
             expressions: nodes.into_iter().map(|(id, node)| (E(id), node)).collect(),
+            select: Default::default(),
         }
     }
 
@@ -640,5 +722,26 @@ mod tests {
 
         assert_eq!(parser.derive(input(B, "base")).zippers.len(), 1);
         assert!(parser.derive(input(A, "miss")).zippers.is_empty());
+    }
+
+    #[test]
+    fn long_right_recursive_prefix_uses_the_operation_stack() {
+        // E ::= A E | B. Completing B unwinds every pending right-recursive
+        // context during the following derivative.
+        let mut parser = Pwz::new(grammar(
+            0,
+            [
+                (0, alt(&[1, 2])),
+                (1, seq(&[3, 0])),
+                (2, tok(B)),
+                (3, tok(A)),
+            ],
+        ));
+
+        for _ in 0..2_000 {
+            assert_eq!(parser.derive(input(A, "prefix")).zippers.len(), 1);
+        }
+        assert_eq!(parser.derive(input(B, "base")).zippers.len(), 1);
+        assert!(parser.derive(input(C, "after")).zippers.is_empty());
     }
 }

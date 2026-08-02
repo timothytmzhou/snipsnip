@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, OnceLock},
+};
 
 use cfgrammar::{
     Symbol as YaccSymbol,
@@ -13,6 +16,7 @@ use regex_automata::{
 };
 use regex_syntax::ParserBuilder as RegexSyntaxParserBuilder;
 use regex_syntax::hir::Look;
+use rustc_hash::FxHashSet as HashSet;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -110,6 +114,8 @@ pub enum GrammarError {
     UnsupportedYaccFeature(String),
     #[error("unsupported Lex feature: {0}")]
     UnsupportedLexFeature(String),
+    #[error("complete-lexeme productivity is unavailable: {0}")]
+    LexicalProductivity(String),
     #[error("this grammar has no Lex specification")]
     NoLexer,
 }
@@ -135,6 +141,7 @@ struct LexRule {
 #[derive(Clone)]
 struct LexMachine {
     rules: Vec<LexRule>,
+    complete_lexeme_terminals: OnceLock<Result<Box<[bool]>, String>>,
 }
 
 #[derive(Clone)]
@@ -146,17 +153,6 @@ pub(crate) struct RuntimeInput {
 impl RuntimeInput {
     pub(crate) fn terminal(&self, name: &str) -> Option<TerminalId> {
         self.terminal_by_name.get(name).copied()
-    }
-
-    pub(crate) fn for_each_terminal(
-        &self,
-        input: &str,
-        emit: impl FnMut(TerminalId),
-    ) -> Result<(), GrammarError> {
-        let machine = self.lexer.as_ref().ok_or(GrammarError::NoLexer)?;
-        let mut emit = emit;
-        scan_with_machine(machine, input, |kind, _, _, _| emit(kind))
-            .map_err(|error| GrammarError::Lex(error.to_string()))
     }
 
     pub(crate) fn lex(&self, input: &str) -> Result<Vec<Token>, GrammarError> {
@@ -211,6 +207,117 @@ impl RuntimeInput {
 }
 
 impl LexMachine {
+    fn complete_lexeme_terminals(&self, terminal_count: usize) -> Result<&[bool], GrammarError> {
+        match self
+            .complete_lexeme_terminals
+            .get_or_init(|| self.compute_complete_lexeme_terminals(terminal_count))
+        {
+            Ok(terminals) => Ok(terminals),
+            Err(reason) => Err(GrammarError::LexicalProductivity(reason.clone())),
+        }
+    }
+
+    fn compute_complete_lexeme_terminals(
+        &self,
+        terminal_count: usize,
+    ) -> Result<Box<[bool]>, String> {
+        if self
+            .rules
+            .iter()
+            .any(|rule| rule.unicode_fallback.is_some())
+        {
+            return Err("Unicode word-boundary fallback cannot yet be analyzed exactly".to_owned());
+        }
+        if self.rules.is_empty() {
+            return Ok(vec![false; terminal_count].into_boxed_slice());
+        }
+
+        let mut inhabited = vec![false; terminal_count];
+        let mut missing = terminal_count;
+        let mut seen = HashSet::default();
+        let mut pending = VecDeque::new();
+
+        // Keep the existing per-rule leftmost-first DFAs. Recompiling all
+        // patterns with `MatchKind::All` would be wrong for ordered choices
+        // such as `a|ab`: the actual rule commits to `a`, which lets a later
+        // `ab` rule win by maximal munch.
+        //
+        // Anchored DFA start states may inspect the first byte to resolve
+        // look-around. Seed the product graph once for each possible first
+        // byte; nullable lexer rules have already been rejected.
+        for byte in u8::MIN..=u8::MAX {
+            let first = [byte];
+            let input = Input::new(&first).anchored(Anchored::Yes);
+            let mut states = Vec::with_capacity(self.rules.len());
+            let mut any_live = false;
+            for rule in &self.rules {
+                let start = rule
+                    .dfa
+                    .start_state_forward(&input)
+                    .map_err(|error| error.to_string())?;
+                let state = rule.dfa.next_state(start, byte);
+                if rule.dfa.is_quit_state(state) {
+                    return Err(format!("lexer DFA quit on byte {byte}"));
+                }
+                any_live |= !rule.dfa.is_dead_state(state);
+                states.push(state);
+            }
+            if any_live && seen.insert(states.clone()) {
+                pending.push_back(states);
+            }
+        }
+
+        while let Some(states) = pending.pop_front() {
+            let mut winning_rule = None;
+            for (index, (rule, state)) in self.rules.iter().zip(&states).enumerate() {
+                let eoi = rule.dfa.next_eoi_state(*state);
+                if rule.dfa.is_quit_state(eoi) {
+                    return Err("lexer DFA quit at end of input".to_owned());
+                }
+                if rule.dfa.is_match_state(eoi) {
+                    winning_rule = Some(index);
+                    break;
+                }
+            }
+            if let Some(winning_rule) = winning_rule
+                && let Some(terminal) = self.rules[winning_rule].terminal
+                && !inhabited[terminal.index()]
+            {
+                inhabited[terminal.index()] = true;
+                missing -= 1;
+                // Normal lexers finish here after finding one short concrete
+                // witness per token. Exhausting the product is needed only to
+                // prove a genuinely shadowed rule.
+                if missing == 0 {
+                    return Ok(inhabited.into_boxed_slice());
+                }
+            }
+
+            if seen.len() > 100_000 {
+                return Err(
+                    "lexer-rule overlap exceeded the exact productivity work limit".to_owned(),
+                );
+            }
+
+            for byte in u8::MIN..=u8::MAX {
+                let mut next_states = Vec::with_capacity(self.rules.len());
+                let mut any_live = false;
+                for (rule, state) in self.rules.iter().zip(&states) {
+                    let next = rule.dfa.next_state(*state, byte);
+                    if rule.dfa.is_quit_state(next) {
+                        return Err(format!("lexer DFA quit on byte {byte}"));
+                    }
+                    any_live |= !rule.dfa.is_dead_state(next);
+                    next_states.push(next);
+                }
+                if any_live && seen.insert(next_states.clone()) {
+                    pending.push_back(next_states);
+                }
+            }
+        }
+        Ok(inhabited.into_boxed_slice())
+    }
+
     fn integer_spelling_matches(
         &self,
         terminal: TerminalId,
@@ -481,6 +588,21 @@ impl Grammar {
         self.terminal_names.len()
     }
 
+    /// Returns exactly which terminals have at least one complete lexeme.
+    ///
+    /// Grammars without a Lex specification consume abstract terminals, so
+    /// every declared terminal is inhabited. Lexer-backed grammars account
+    /// for maximal munch, rule priority, and ignored rules.
+    pub(crate) fn complete_lexeme_terminals(&self) -> Result<Box<[bool]>, GrammarError> {
+        let Some(machine) = &self.lexer else {
+            return Ok(vec![true; self.terminal_count()].into_boxed_slice());
+        };
+        Ok(machine
+            .complete_lexeme_terminals(self.terminal_count())?
+            .to_vec()
+            .into_boxed_slice())
+    }
+
     pub fn lex(&self, input: &str) -> Result<Vec<Token>, GrammarError> {
         let machine = self.lexer.as_ref().ok_or(GrammarError::NoLexer)?;
         lex_with_machine(machine, input).map_err(|error| GrammarError::Lex(error.to_string()))
@@ -658,7 +780,10 @@ fn build_lexer(
             unicode_fallback,
         });
     }
-    Ok(Arc::new(LexMachine { rules }))
+    Ok(Arc::new(LexMachine {
+        rules,
+        complete_lexeme_terminals: OnceLock::new(),
+    }))
 }
 
 fn dedent(source: &str) -> String {

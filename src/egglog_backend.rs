@@ -4,11 +4,12 @@ use std::{
 };
 
 use crate::{
-    disjoint::expand_free_commands,
-    fixed_tree::{BindingId, BindingRhs, ExactSource, PendingBinding},
+    error::LiveMonitorError,
     grammar::{Action, Grammar, RuntimeInput, Symbol, TerminalId},
-    live::LiveMonitorError,
-    realizability::{ConstructorId, ConstructorSchema, SortId},
+    realizability::{
+        ConstructorId, ConstructorSchema, EGraphChange, EGraphView, EGraphWriter,
+        Enode as CoreEnode, SortId, TypedClass,
+    },
 };
 use egglog::{
     ArcSort, EGraph, ExecutionState, Primitive, Value,
@@ -17,7 +18,7 @@ use egglog::{
         Subdatatypes,
     },
     constraint::{SimpleTypeConstraint, TypeConstraint},
-    prelude::{BaseSort, RustSpan, Span, UnitSort},
+    prelude::{BaseSort, I64Sort, RustSpan, Span, UnitSort},
     sort::S,
 };
 
@@ -27,13 +28,6 @@ use egglog::{
 pub(crate) struct ValueId(Value);
 
 impl ValueId {
-    pub(crate) const NONE: Self = Self(Value::new_const(u32::MAX));
-
-    #[cfg(test)]
-    pub(crate) const fn from_raw_for_test(value: u32) -> Self {
-        Self(Value::new_const(value))
-    }
-
     #[inline]
     fn from_egglog(value: Value) -> Self {
         Self(value)
@@ -47,11 +41,7 @@ impl ValueId {
 
 #[derive(Clone, Debug)]
 pub(crate) struct BackendSchema {
-    pub(crate) target_sort: SortId,
-    pub(crate) sort_count: usize,
     pub(crate) constructors: Vec<ConstructorSchema>,
-    pub(crate) terminal_sorts: Vec<Vec<SortId>>,
-    pub(crate) selected_terminals: Vec<bool>,
     constructor_ids: HashMap<String, ConstructorId>,
 }
 
@@ -62,34 +52,14 @@ impl BackendSchema {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum BackendFact {
-    Target {
-        sort: SortId,
-        value: ValueId,
-    },
-    Enode {
-        constructor: ConstructorId,
-        output: ValueId,
-        children: Vec<ValueId>,
-    },
-    Domain {
-        sort: SortId,
-        value: ValueId,
-        lexical_form: String,
-        integer: Option<i64>,
-    },
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct ExactToken {
     pub(crate) sort: SortId,
     pub(crate) value: ValueId,
-    pub(crate) source: ExactSource,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct BackendDelta {
-    pub(crate) facts: Vec<BackendFact>,
+    pub(crate) changes: Vec<EGraphChange>,
     pub(crate) saturation: SaturationRun,
 }
 
@@ -152,10 +122,6 @@ enum CapturedFact {
         value: Value,
         lexical_form: String,
         integer: Option<i64>,
-    },
-    Disjoint {
-        left: Value,
-        right: Value,
     },
 }
 
@@ -240,13 +206,13 @@ impl Primitive for CaptureDomain {
 }
 
 #[derive(Clone)]
-struct CaptureDisjoint {
+struct RecallValue {
     name: String,
     sort: ArcSort,
-    buffer: CaptureBuffer,
+    values: Arc<Mutex<Vec<Value>>>,
 }
 
-impl Primitive for CaptureDisjoint {
+impl Primitive for RecallValue {
     fn name(&self) -> &str {
         &self.name
     }
@@ -254,21 +220,17 @@ impl Primitive for CaptureDisjoint {
     fn get_type_constraints(&self, span: &egglog::ast::Span) -> Box<dyn TypeConstraint> {
         SimpleTypeConstraint::new(
             self.name(),
-            vec![self.sort.clone(), self.sort.clone(), UnitSort.to_arcsort()],
+            vec![I64Sort.to_arcsort(), self.sort.clone()],
             span.clone(),
         )
         .into_box()
     }
 
     fn apply(&self, state: &mut ExecutionState<'_>, arguments: &[Value]) -> Option<Value> {
-        let [left, right] = arguments else {
-            return None;
-        };
-        self.buffer.lock().unwrap().push(CapturedFact::Disjoint {
-            left: *left,
-            right: *right,
-        });
-        Some(state.base_values().get::<()>(()))
+        let index = state.base_values().unwrap::<i64>(arguments[0]);
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.values.lock().unwrap().get(index).copied())
     }
 }
 
@@ -279,14 +241,9 @@ struct TokenSortSpec {
 }
 
 struct MatcherNames {
-    target_sort: String,
     ruleset: String,
     saturation_ruleset: String,
     relevant_ruleset: String,
-    free_ruleset: Option<String>,
-    free_reach: BTreeMap<String, String>,
-    disjoint_relation: Option<String>,
-    capture_disjoint: Option<String>,
     targets: String,
     sorts: BTreeMap<String, SortSpec>,
     saturation_reach: BTreeMap<String, String>,
@@ -301,40 +258,53 @@ struct MatcherNames {
     token_sorts: Vec<Vec<TokenSortSpec>>,
 }
 
+struct TargetValue {
+    sort: ArcSort,
+    sort_id: SortId,
+    value: Value,
+}
+
+struct CapturedView {
+    targets: Vec<TypedClass<ValueId>>,
+    enodes: Vec<Vec<CoreEnode<ValueId>>>,
+    enode_seen: Vec<HashSet<CoreEnode<ValueId>>>,
+    terminals: Vec<Vec<TypedClass<ValueId>>>,
+    terminal_seen: Vec<HashSet<TypedClass<ValueId>>>,
+}
+
+struct ValueRecall {
+    values: Arc<Mutex<Vec<Value>>>,
+    names: Vec<String>,
+}
+
 /// Owns the egglog instance and every piece of state whose meaning depends on
 /// egglog's values, schemas, commands, or scheduler.
 pub(crate) struct EgglogBackend {
     egraph: EGraph,
+    input: RuntimeInput,
     names: MatcherNames,
     private_prefix: String,
     captures: CaptureBuffer,
-    target_sort: ArcSort,
-    target_sort_id: SortId,
-    target_value: Value,
+    target: TargetValue,
     constructor_names: Vec<String>,
     sort_metadata: Vec<(String, ArcSort)>,
     relevance_marked_values: HashSet<(SortId, Value)>,
-    disjoint_pairs: HashSet<(Value, Value)>,
-    complete_free_constructor_ids: HashSet<ConstructorId>,
-    complete_disjoint_candidate: bool,
-    complete_disjoint_target: bool,
-    local_saturation_complete: bool,
+    constructor_schemas: Vec<ConstructorSchema>,
+    view: CapturedView,
+    recall: ValueRecall,
 }
 
 impl EgglogBackend {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn initialize(
         grammar: &Grammar,
         input: &RuntimeInput,
         program: &str,
         target_binding: &str,
-        disjoint_relation: Option<&str>,
         locally_saturate_initial_rewrites: bool,
         initial_round_limit: usize,
     ) -> Result<BackendInit, LiveMonitorError> {
         let mut egraph = EGraph::default();
         let prefix = choose_prefix(&egraph, program);
-        let free_ruleset = format!("{prefix}_free_rules");
         let initial_commands = egraph
             .parser
             .get_program_from_string(None, program)
@@ -358,13 +328,10 @@ impl EgglogBackend {
         } else {
             (Vec::new(), initial_commands)
         };
-        let expansion = expand_free_commands(setup_commands, &free_ruleset)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        let declared_constructors = collect_declared_constructors(&expansion.commands);
-        let declared_functions = collect_declared_functions(&expansion.commands);
-        let free_sorts = expansion.free_sorts;
+        let declared_constructors = collect_declared_constructors(&setup_commands);
+        let declared_functions = collect_declared_functions(&setup_commands);
         egraph
-            .run_program(expansion.commands)
+            .run_program(setup_commands)
             .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
 
         let binding_source = normalize_binding(target_binding)?;
@@ -394,17 +361,7 @@ impl EgglogBackend {
             ));
         }
 
-        let complete_free_spec = match disjoint_relation {
-            Some(relation) => {
-                validate_disjoint_relation(&egraph, relation, target_sort.name())?;
-                free_sorts.iter().any(|spec| {
-                    spec.sort == target_sort.name() && spec.relation == relation && spec.complete
-                })
-            }
-            None => false,
-        };
-
-        let mut names = build_specs(
+        let names = build_specs(
             grammar,
             &egraph,
             input,
@@ -413,21 +370,6 @@ impl EgglogBackend {
             &declared_constructors,
             declared_functions,
         )?;
-        names.free_ruleset = (!free_sorts.is_empty()).then_some(free_ruleset);
-        names.free_reach = free_sorts
-            .iter()
-            .map(|spec| (spec.sort.clone(), spec.reach.clone()))
-            .collect();
-        if let Some(relation) = disjoint_relation {
-            names.disjoint_relation = Some(relation.to_owned());
-            names.capture_disjoint = Some(format!("{prefix}_capture_disjoint"));
-        }
-
-        let selected_terminals = names
-            .token_sorts
-            .iter()
-            .map(|sorts| !sorts.is_empty())
-            .collect::<Vec<_>>();
         let captures = Arc::new(Mutex::new(Vec::new()));
         register_capture_primitives(&mut egraph, &names, captures.clone());
         let rules = build_matcher_program(&names, target_sort.name());
@@ -435,29 +377,16 @@ impl EgglogBackend {
             .parse_and_run_program(None, &rules)
             .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
         insert_target(&mut egraph, &names.targets, binding_expression.clone())?;
-        if let Some(reach) = names.free_reach.get(target_sort.name()) {
-            egraph
-                .run_program(vec![call_command(reach, vec![binding_expression])])
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        }
 
         let target_sort_id = names.sorts[target_sort.name()].id;
         let constructors = constructor_schemas(&names);
-        let mut terminal_sorts = vec![Vec::new(); grammar.terminal_count()];
-        for (terminal, sorts) in names.token_sorts.iter().enumerate() {
-            terminal_sorts[terminal].extend(sorts.iter().map(|sort| names.sorts[&sort.sort].id));
-        }
         let constructor_ids = names
             .constructors
             .iter()
             .map(|(name, spec)| (name.clone(), spec.id))
             .collect();
         let schema = BackendSchema {
-            target_sort: target_sort_id,
-            sort_count: names.sorts.len(),
-            constructors,
-            terminal_sorts,
-            selected_terminals,
+            constructors: constructors.clone(),
             constructor_ids,
         };
 
@@ -473,42 +402,51 @@ impl EgglogBackend {
                 .clone();
             sort_metadata[sort.id] = Some((sort.name.clone(), egglog_sort));
         }
-        let sort_metadata = sort_metadata
+        let sort_metadata: Vec<(String, ArcSort)> = sort_metadata
             .into_iter()
             .map(|sort| sort.expect("sort IDs are dense"))
             .collect();
-        let complete_free_names = free_sorts
+        let recalled_values = Arc::new(Mutex::new(Vec::new()));
+        let recall_names = sort_metadata
             .iter()
-            .filter(|spec| spec.complete)
-            .flat_map(|spec| spec.constructors.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let complete_free_constructor_ids = names
-            .constructors
-            .values()
-            .filter(|constructor| complete_free_names.contains(&constructor.name))
-            .map(|constructor| constructor.id)
-            .collect::<HashSet<_>>();
-        let grammar_is_in_complete_free_family = names
-            .constructors
-            .values()
-            .all(|constructor| complete_free_names.contains(&constructor.name));
+            .enumerate()
+            .map(|(sort, (_, egglog_sort))| {
+                let name = format!("{prefix}_recall_{sort}");
+                egraph.add_primitive(RecallValue {
+                    name: name.clone(),
+                    sort: egglog_sort.clone(),
+                    values: recalled_values.clone(),
+                });
+                name
+            })
+            .collect();
 
         let mut backend = Self {
             egraph,
+            input: input.clone(),
             names,
             private_prefix: prefix,
             captures,
-            target_sort,
-            target_sort_id,
-            target_value,
+            target: TargetValue {
+                sort: target_sort,
+                sort_id: target_sort_id,
+                value: target_value,
+            },
             constructor_names,
             sort_metadata,
             relevance_marked_values: HashSet::new(),
-            disjoint_pairs: HashSet::new(),
-            complete_free_constructor_ids,
-            complete_disjoint_candidate: complete_free_spec && grammar_is_in_complete_free_family,
-            complete_disjoint_target: false,
-            local_saturation_complete: true,
+            constructor_schemas: constructors.clone(),
+            view: CapturedView {
+                targets: Vec::new(),
+                enodes: vec![Vec::new(); constructors.len()],
+                enode_seen: vec![HashSet::new(); constructors.len()],
+                terminals: vec![Vec::new(); grammar.terminal_count()],
+                terminal_seen: vec![HashSet::new(); grammar.terminal_count()],
+            },
+            recall: ValueRecall {
+                values: recalled_values,
+                names: recall_names,
+            },
         };
 
         let mut saturation = backend.saturate_matcher(usize::MAX)?;
@@ -525,7 +463,6 @@ impl EgglogBackend {
                 .basin_matches
                 .saturating_add(managed.basin_matches);
             saturation.complete = managed.complete;
-            backend.local_saturation_complete = managed.complete;
         }
         let delta = backend.take_delta(saturation);
         Ok(BackendInit {
@@ -554,7 +491,6 @@ impl EgglogBackend {
                     value: ValueId::from_egglog(
                         self.egraph.base_to_value::<S>(lexeme.to_owned().into()),
                     ),
-                    source: ExactSource::String(Arc::from(lexeme)),
                 },
                 PrimitiveKind::I64 => {
                     let Ok(integer) = lexeme.parse() else {
@@ -563,7 +499,6 @@ impl EgglogBackend {
                     ExactToken {
                         sort,
                         value: ValueId::from_egglog(self.egraph.base_to_value::<i64>(integer)),
-                        source: ExactSource::I64(integer),
                     }
                 }
             };
@@ -576,90 +511,11 @@ impl EgglogBackend {
         self.names.token_sorts.len()
     }
 
-    pub(crate) fn bind_concrete_asts(
-        &mut self,
-        requests: &[PendingBinding],
-    ) -> Result<Vec<ValueId>, LiveMonitorError> {
-        let mut constructor_sizes = HashMap::new();
-        let mut actions = Vec::with_capacity(requests.len());
-        for request in requests {
-            if let BindingRhs::Constructor { constructor, .. } = &request.rhs {
-                let constructor = &self.constructor_names[*constructor];
-                constructor_sizes
-                    .entry(constructor.clone())
-                    .or_insert_with(|| self.egraph.get_size(constructor));
-            }
-            actions.push(Command::Action(EggAction::Let(
-                egglog::span!(),
-                fixed_binding_name(request.binding, &self.private_prefix),
-                fixed_binding_expression(request, &self.constructor_names, &self.private_prefix),
-            )));
-        }
-        self.egraph
-            .run_program(actions)
-            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        let inserted_enode = constructor_sizes
-            .iter()
-            .any(|(constructor, size)| self.egraph.get_size(constructor) > *size);
-
-        let mut values = Vec::with_capacity(requests.len());
-        let mut relevance_actions = Vec::new();
-        let mut relevance_sizes = HashMap::new();
-        for request in requests {
-            let name = fixed_binding_name(request.binding, &self.private_prefix);
-            let (_, value) = self
-                .egraph
-                .eval_expr(&Expr::Var(egglog::span!(), name))
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-            values.push(ValueId::from_egglog(value));
-
-            let Some((sort_name, egglog_sort)) = self.sort_metadata.get(request.sort) else {
-                continue;
-            };
-            let canonical = self.egraph.get_canonical_value(value, egglog_sort);
-            if !self
-                .relevance_marked_values
-                .insert((request.sort, canonical))
-            {
-                continue;
-            }
-            let binding = Expr::Var(
-                egglog::span!(),
-                fixed_binding_name(request.binding, &self.private_prefix),
-            );
-            if let Some(reach) = self.names.saturation_reach.get(sort_name) {
-                relevance_sizes
-                    .entry(reach.clone())
-                    .or_insert_with(|| self.egraph.get_size(reach));
-                relevance_actions.push(call_command(reach, vec![binding.clone()]));
-            }
-            if let Some(reach) = self.names.free_reach.get(sort_name) {
-                relevance_sizes
-                    .entry(reach.clone())
-                    .or_insert_with(|| self.egraph.get_size(reach));
-                relevance_actions.push(call_command(reach, vec![binding]));
-            }
-        }
-        if !relevance_actions.is_empty() {
-            self.egraph
-                .run_program(relevance_actions)
-                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-        }
-        let added_relevance = relevance_sizes
-            .iter()
-            .any(|(relation, size)| self.egraph.get_size(relation) > *size);
-        if inserted_enode || added_relevance {
-            self.local_saturation_complete = false;
-        }
-        Ok(values)
-    }
-
     pub(crate) fn saturate_local(
         &mut self,
         round_limit: usize,
     ) -> Result<BackendDelta, LiveMonitorError> {
         let saturation = self.saturate_matcher(round_limit)?;
-        self.local_saturation_complete = saturation.complete;
         Ok(self.take_delta(saturation))
     }
 
@@ -736,9 +592,6 @@ impl EgglogBackend {
         self.names.saturation_initialized = plan.saturation_initialized;
         self.names.projected_functions = plan.projected_functions;
         self.names.installed_rewrite_directions = plan.installed_rewrite_directions;
-        if plan.rewrite_count != 0 {
-            self.local_saturation_complete = false;
-        }
         Ok(plan.rewrite_count)
     }
 
@@ -791,23 +644,10 @@ impl EgglogBackend {
                     break false;
                 }
                 rounds = rounds.saturating_add(1);
-                let free = match &self.names.free_ruleset {
-                    Some(ruleset) => Some(
-                        self.egraph
-                            .step_rules(ruleset)
-                            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?,
-                    ),
-                    None => None,
-                };
                 let projection = self
                     .egraph
                     .step_rules(&self.names.ruleset)
                     .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-                projection_matches = projection_matches.saturating_add(
-                    free.as_ref()
-                        .map(|report| report.num_matches_per_rule.values().copied().sum::<usize>())
-                        .unwrap_or(0),
-                );
                 projection_matches = projection_matches.saturating_add(
                     projection
                         .num_matches_per_rule
@@ -815,7 +655,7 @@ impl EgglogBackend {
                         .copied()
                         .sum::<usize>(),
                 );
-                if !projection.updated && !free.is_some_and(|report| report.updated) {
+                if !projection.updated {
                     break true;
                 }
             };
@@ -840,14 +680,6 @@ impl EgglogBackend {
                 .egraph
                 .step_rules(&self.names.saturation_ruleset)
                 .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
-            let free = match &self.names.free_ruleset {
-                Some(ruleset) => Some(
-                    self.egraph
-                        .step_rules(ruleset)
-                        .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?,
-                ),
-                None => None,
-            };
             let projection = self
                 .egraph
                 .step_rules(&self.names.ruleset)
@@ -867,22 +699,13 @@ impl EgglogBackend {
                     .sum::<usize>(),
             );
             projection_matches = projection_matches.saturating_add(
-                free.as_ref()
-                    .map(|report| report.num_matches_per_rule.values().copied().sum::<usize>())
-                    .unwrap_or(0),
-            );
-            projection_matches = projection_matches.saturating_add(
                 projection
                     .num_matches_per_rule
                     .values()
                     .copied()
                     .sum::<usize>(),
             );
-            if !relevant.updated
-                && !saturation.updated
-                && !free.is_some_and(|report| report.updated)
-                && !projection.updated
-            {
+            if !relevant.updated && !saturation.updated && !projection.updated {
                 break true;
             }
         };
@@ -896,7 +719,8 @@ impl EgglogBackend {
 
     fn take_delta(&mut self, saturation: SaturationRun) -> BackendDelta {
         let captured = std::mem::take(&mut *self.captures.lock().unwrap());
-        let mut facts = Vec::with_capacity(captured.len() + 1);
+        let mut changes = Vec::new();
+        let mut changed_constructors = vec![false; self.view.enodes.len()];
         for fact in captured {
             match fact {
                 CapturedFact::Enode {
@@ -904,98 +728,196 @@ impl EgglogBackend {
                     output,
                     children,
                 } => {
-                    let is_target_constructor =
-                        self.names.constructors[&self.constructor_names[constructor]].output
-                            == self.names.target_sort;
-                    if is_target_constructor
-                        && self.complete_disjoint_candidate
-                        && self.complete_free_constructor_ids.contains(&constructor)
-                        && self.egraph.get_canonical_value(output, &self.target_sort)
-                            == self
-                                .egraph
-                                .get_canonical_value(self.target_value, &self.target_sort)
-                    {
-                        self.complete_disjoint_target = true;
-                    }
-                    facts.push(BackendFact::Enode {
-                        constructor,
-                        output: ValueId::from_egglog(output),
-                        children: children.into_iter().map(ValueId::from_egglog).collect(),
+                    let schema = &self.constructor_schemas[constructor];
+                    let output = self.canonical_value(TypedClass {
+                        sort: schema.output,
+                        class: ValueId::from_egglog(output),
                     });
+                    let children = children
+                        .into_iter()
+                        .zip(&schema.inputs)
+                        .map(|(class, &sort)| {
+                            self.canonical_value(TypedClass {
+                                sort,
+                                class: ValueId::from_egglog(class),
+                            })
+                            .class
+                        })
+                        .collect::<Vec<_>>();
+                    let enode = CoreEnode {
+                        output: output.class,
+                        children: children.into(),
+                    };
+                    if self.view.enode_seen[constructor].insert(enode.clone()) {
+                        self.view.enodes[constructor].push(enode);
+                    }
+                    // Rebuild can canonicalize an affected row to one already
+                    // stored here. The row still has to wake the cross-product
+                    // because an old parser fact may only now compare equal.
+                    changed_constructors[constructor] = true;
                 }
                 CapturedFact::Domain {
                     sort,
                     value,
                     lexical_form,
                     integer,
-                } => facts.push(BackendFact::Domain {
-                    sort,
-                    value: ValueId::from_egglog(value),
-                    lexical_form,
-                    integer,
-                }),
-                CapturedFact::Disjoint { left, right } => {
-                    let left = self.egraph.get_canonical_value(left, &self.target_sort);
-                    let right = self.egraph.get_canonical_value(right, &self.target_sort);
-                    self.disjoint_pairs.insert((left, right));
+                } => {
+                    let value = self
+                        .canonical_value(TypedClass {
+                            sort,
+                            class: ValueId::from_egglog(value),
+                        })
+                        .class;
+                    for terminal in 0..self.view.terminals.len() {
+                        let terminal_id = TerminalId(terminal);
+                        let uses_sort = self.names.token_sorts[terminal]
+                            .iter()
+                            .any(|token| self.names.sorts[&token.sort].id == sort);
+                        let matches = uses_sort
+                            && (integer.is_some_and(|integer| {
+                                self.input.i64_lexeme_matches(terminal_id, integer)
+                            }) || (integer.is_none()
+                                && self.input.lexeme_matches(terminal_id, &lexical_form)));
+                        let typed = TypedClass { sort, class: value };
+                        if matches && self.view.terminal_seen[terminal].insert(typed) {
+                            self.view.terminals[terminal].push(typed);
+                            changes.push(EGraphChange::Terminal(
+                                u32::try_from(terminal).expect("terminal count exceeds u32"),
+                            ));
+                        }
+                    }
                 }
             }
         }
         let target = self
             .egraph
-            .get_canonical_value(self.target_value, &self.target_sort);
-        facts.push(BackendFact::Target {
-            sort: self.target_sort_id,
-            value: ValueId::from_egglog(target),
+            .get_canonical_value(self.target.value, &self.target.sort);
+        self.view.targets.clear();
+        self.view.targets.push(TypedClass {
+            sort: self.target.sort_id,
+            class: ValueId::from_egglog(target),
         });
-        BackendDelta { facts, saturation }
+        changes.push(EGraphChange::Target);
+        changes.extend(changed_constructors.into_iter().enumerate().filter_map(
+            |(constructor, changed)| changed.then_some(EGraphChange::Constructor(constructor)),
+        ));
+        BackendDelta {
+            changes,
+            saturation,
+        }
+    }
+
+    fn canonical_value(&self, value: TypedClass<ValueId>) -> TypedClass<ValueId> {
+        TypedClass {
+            sort: value.sort,
+            class: ValueId::from_egglog(
+                self.egraph.get_canonical_value(
+                    value.class.into_egglog(),
+                    &self.sort_metadata[value.sort].1,
+                ),
+            ),
+        }
+    }
+
+    fn recall_expr(&self, value: TypedClass<ValueId>) -> Expr {
+        let mut values = self.recall.values.lock().unwrap();
+        let index = i64::try_from(values.len()).expect("focused value count exceeds i64");
+        values.push(value.class.into_egglog());
+        Expr::Call(
+            egglog::span!(),
+            self.recall.names[value.sort].clone(),
+            vec![Expr::Lit(egglog::span!(), Literal::Int(index))],
+        )
     }
 
     pub(crate) fn focus_enabled(&self) -> bool {
-        self.names.disjoint_relation.is_some()
-            || self.names.free_ruleset.is_some()
-            || self.names.saturation_initialized
-    }
-
-    pub(crate) fn managed_rules_enabled(&self) -> bool {
         self.names.saturation_initialized
     }
+}
 
-    pub(crate) fn disjoint_enabled(&self) -> bool {
-        self.names.disjoint_relation.is_some()
+impl EGraphView<ValueId> for EgglogBackend {
+    fn canonical(&self, value: TypedClass<ValueId>) -> TypedClass<ValueId> {
+        self.canonical_value(value)
     }
 
-    pub(crate) fn needs_disjoint_candidates(&self) -> bool {
-        self.disjoint_enabled() && !self.complete_disjoint_target
+    fn targets(&self) -> &[TypedClass<ValueId>] {
+        &self.view.targets
     }
 
-    pub(crate) fn local_saturation_complete(&self) -> bool {
-        self.local_saturation_complete
+    fn terminal_classes(&self, terminal: u32) -> &[TypedClass<ValueId>] {
+        self.view
+            .terminals
+            .get(terminal as usize)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
-    pub(crate) fn proves_disjoint_from_target(
-        &self,
-        candidates_complete: bool,
-        candidates: &[(SortId, ValueId)],
-    ) -> bool {
-        if self.local_saturation_complete && self.complete_disjoint_target {
-            return true;
-        }
-        if !self.disjoint_enabled() || !candidates_complete || candidates.is_empty() {
-            return false;
-        }
-        let target = self
+    fn enodes(&self, constructor: ConstructorId) -> &[CoreEnode<ValueId>] {
+        self.view
+            .enodes
+            .get(constructor)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+impl EGraphWriter<ValueId> for EgglogBackend {
+    type Error = LiveMonitorError;
+
+    fn construct(
+        &mut self,
+        constructor: ConstructorId,
+        children: &[TypedClass<ValueId>],
+    ) -> Result<TypedClass<ValueId>, Self::Error> {
+        let expression = Expr::Call(
+            egglog::span!(),
+            self.constructor_names[constructor].clone(),
+            children
+                .iter()
+                .copied()
+                .map(|child| self.recall_expr(child))
+                .collect(),
+        );
+        let (_, output) = self
             .egraph
-            .get_canonical_value(self.target_value, &self.target_sort);
-        candidates.iter().all(|&(sort, value)| {
-            if sort != self.target_sort_id {
-                return false;
+            .eval_expr(&expression)
+            .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
+        let schema = &self.constructor_schemas[constructor];
+        let output = self.canonical_value(TypedClass {
+            sort: schema.output,
+            class: ValueId::from_egglog(output),
+        });
+        let enode = CoreEnode {
+            output: output.class,
+            children: children.iter().map(|child| child.class).collect(),
+        };
+        if self.view.enode_seen[constructor].insert(enode.clone()) {
+            self.view.enodes[constructor].push(enode);
+        }
+        Ok(output)
+    }
+
+    fn mark_relevant(&mut self, values: &[TypedClass<ValueId>]) -> Result<(), Self::Error> {
+        let mut actions = Vec::new();
+        for value in values.iter().copied() {
+            let value = self.canonical_value(value);
+            if !self
+                .relevance_marked_values
+                .insert((value.sort, value.class.into_egglog()))
+            {
+                continue;
             }
-            let value = self
-                .egraph
-                .get_canonical_value(value.into_egglog(), &self.target_sort);
-            self.disjoint_pairs.contains(&(value, target))
-        })
+            let sort_name = &self.sort_metadata[value.sort].0;
+            if let Some(relation) = self.names.saturation_reach.get(sort_name) {
+                actions.push(call_command(relation, vec![self.recall_expr(value)]));
+            }
+        }
+        if !actions.is_empty() {
+            self.egraph
+                .run_program(actions)
+                .map_err(|error| LiveMonitorError::Egglog(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -1599,14 +1521,9 @@ fn build_specs(
     // retain the original target-projection cost.
     let projected_functions = BTreeSet::new();
     Ok(MatcherNames {
-        target_sort: target_sort.to_owned(),
         ruleset: format!("{prefix}_rules"),
         saturation_ruleset: format!("{prefix}_saturation_rules"),
         relevant_ruleset: format!("{prefix}_relevant_rules"),
-        free_ruleset: None,
-        free_reach: BTreeMap::new(),
-        disjoint_relation: None,
-        capture_disjoint: None,
         targets: format!("{prefix}_targets"),
         sorts: sort_specs,
         saturation_reach,
@@ -1654,16 +1571,6 @@ fn register_capture_primitives(egraph: &mut EGraph, names: &MatcherNames, buffer
             sort_id: sort.id,
             kind,
             buffer: buffer.clone(),
-        });
-    }
-    if let Some(capture) = &names.capture_disjoint {
-        egraph.add_primitive(CaptureDisjoint {
-            name: capture.clone(),
-            sort: egraph
-                .get_sort_by_name(&names.target_sort)
-                .expect("target sort was checked")
-                .clone(),
-            buffer,
         });
     }
 }
@@ -1727,24 +1634,6 @@ fn build_matcher_program(names: &MatcherNames, target_sort: &str) -> String {
         names.targets, root_reach, names.ruleset
     ));
 
-    if let (Some(relation), Some(capture)) = (&names.disjoint_relation, &names.capture_disjoint) {
-        let same = format!("{}_disjoint_same", names.targets);
-        let candidate = format!("{}_disjoint_candidate", names.targets);
-        let target = format!("{}_disjoint_target", names.targets);
-        source.push_str(&format!(
-            "(rule (({relation} {same} {same})) ((panic \"disjointness relation `{relation}` contains an equal pair\")) :ruleset {})\n",
-            names.ruleset
-        ));
-        source.push_str(&format!(
-            "(rule (({root_reach} {target}) ({relation} {candidate} {target})) (({capture} {candidate} {target})) :ruleset {})\n",
-            names.ruleset
-        ));
-        source.push_str(&format!(
-            "(rule (({root_reach} {target}) ({relation} {target} {candidate})) (({capture} {candidate} {target})) :ruleset {})\n",
-            names.ruleset
-        ));
-    }
-
     for constructor in names.constructors.values() {
         let child_values = (0..constructor.inputs.len())
             .map(|index| format!("value{index}"))
@@ -1794,61 +1683,6 @@ fn call_command(name: &str, arguments: Vec<Expr>) -> Command {
         egglog::span!(),
         Expr::Call(egglog::span!(), name.to_owned(), arguments),
     ))
-}
-
-fn fixed_binding_name(binding: BindingId, private_prefix: &str) -> String {
-    format!(
-        "${}_fixed_tree_{}",
-        private_prefix.trim_start_matches('$'),
-        binding.index()
-    )
-}
-
-fn fixed_binding_expression(
-    request: &PendingBinding,
-    constructor_names: &[String],
-    private_prefix: &str,
-) -> Expr {
-    match &request.rhs {
-        BindingRhs::Exact(ExactSource::String(value)) => {
-            Expr::Lit(egglog::span!(), Literal::String(value.to_string()))
-        }
-        BindingRhs::Exact(ExactSource::I64(value)) => {
-            Expr::Lit(egglog::span!(), Literal::Int(*value))
-        }
-        BindingRhs::Constructor {
-            constructor,
-            children,
-        } => Expr::Call(
-            egglog::span!(),
-            constructor_names[*constructor].clone(),
-            children
-                .iter()
-                .map(|child| Expr::Var(egglog::span!(), fixed_binding_name(*child, private_prefix)))
-                .collect(),
-        ),
-    }
-}
-
-fn validate_disjoint_relation(
-    egraph: &EGraph,
-    relation: &str,
-    target_sort: &str,
-) -> Result<(), LiveMonitorError> {
-    let function = egraph
-        .get_function(relation)
-        .ok_or_else(|| LiveMonitorError::UnknownDisjointRelation(relation.to_owned()))?;
-    let schema = function.schema();
-    let valid = schema.input.len() == 2
-        && schema.input.iter().all(|sort| sort.name() == target_sort)
-        && schema.output.name() == "Unit";
-    if !valid {
-        return Err(LiveMonitorError::InvalidDisjointRelation {
-            relation: relation.to_owned(),
-            sort: target_sort.to_owned(),
-        });
-    }
-    Ok(())
 }
 
 fn collect_declared_constructors(commands: &[Command]) -> BTreeSet<String> {

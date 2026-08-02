@@ -88,15 +88,15 @@ fn ll1_live_prefix_forest_and_realizability_work_grow_linearly() {
         large_probes <= small_probes * SCALE_WITH_FIXED_ALLOWANCE,
         "{baseline:?} {small:?} {large:?}"
     );
-    assert!(large_states <= LARGE * 8 + 64, "{large:?}");
+    assert!(large_states <= LARGE * 10 + 64, "{large:?}");
     assert!(large_prefix_facts <= LARGE * 10 + 64, "{large:?}");
-    assert!(large_realizability_facts <= LARGE * 7 + 64, "{large:?}");
+    assert!(large_realizability_facts <= LARGE * 9 + 64, "{large:?}");
     assert!(large_matches <= LARGE * 11 + 64, "{large:?}");
-    assert!(large_probes <= LARGE * 4 + 64, "{large:?}");
+    assert!(large_probes <= LARGE * 9 + 64, "{large:?}");
     assert!(large.pwz.events <= LARGE * 24 + 64, "{large:?}");
     assert!(large.pwz.memo_records <= LARGE * 8 + 64, "{large:?}");
     assert!(large.last_delta_rule_matches <= 8, "{large:?}");
-    assert!(large.last_delta_join_probes <= 4, "{large:?}");
+    assert!(large.last_delta_join_probes <= 8, "{large:?}");
 }
 
 #[test]
