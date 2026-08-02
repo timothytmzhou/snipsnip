@@ -30,10 +30,8 @@ const LIST_EGRAPH: &str = r#"
     (let $junk-right (JunkRight))
 "#;
 
-// This exercises the complete value-producing PwZ forest and its local fact
-// indexes, but has no target-reachable constructor row with which those facts
-// can join. It is the closest public-API baseline for the semantic forest;
-// `ForestPwz` itself is intentionally crate-private.
+// This exercises PwZ plus the Monitor's local link indexes, but has no
+// target-reachable constructor row with which those links can join.
 const UNMATCHED_EGRAPH: &str = r#"
     (datatype Ast (List Ast) (Cons Ast) (Nil) (Junk))
     (let $root (Junk))

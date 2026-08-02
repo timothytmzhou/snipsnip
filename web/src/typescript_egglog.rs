@@ -1,8 +1,9 @@
 //! Standalone Egglog program for the TypeScript subset used by the web demo.
 //!
 //! This module deliberately contains no parsing or streaming integration. The
-//! program consumes concrete `Goal` terms and classifies them by equality with
-//! `Accept` or `Reject`.
+//! program classifies `Goal` terms by equality with `Accept` or `Reject`. Its
+//! unconditional error-propagation rewrites also cover enclosing expressions
+//! whose remaining syntax has not arrived.
 
 pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
 (datatype Expr
@@ -70,6 +71,10 @@ pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
 (rewrite
   (Call (NumberFunctionExpression) (NumberFunctionExpression))
   (NumberExpression))
+;; Primitive values themselves are not callable.
+(rewrite (Call (NumberExpression) other) (ExpressionError))
+(rewrite (Call (StringExpression) other) (ExpressionError))
+(rewrite (Call (BooleanExpression) other) (ExpressionError))
 
 ;; Numeric arithmetic.
 (birewrite (Subtract (NumberExpression) (NumberExpression)) (NumberExpression))
@@ -141,6 +146,8 @@ pub const DEFAULT_EGGLOG_PROGRAM: &str = r#"
 (rewrite (LessThan (ExpressionError) other) (ExpressionError))
 (rewrite (LessThan other (ExpressionError)) (ExpressionError))
 (rewrite (Property (ExpressionError) property) (ExpressionError))
+(rewrite (Call (ExpressionError) other) (ExpressionError))
+(rewrite (Call other (ExpressionError)) (ExpressionError))
 
 ;; Assignment compatibility for primitive annotations.
 (birewrite (Analyze (LetDeclaration (NumberAnnotation) (NumberExpression))) (Accept))

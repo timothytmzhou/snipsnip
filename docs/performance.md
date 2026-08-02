@@ -11,11 +11,11 @@ causes:
 4. a lookup against the current zipper frontier.
 
 No earlier token is replayed, no parse/e-graph product is rebuilt, and no
-Egglog copy is made. If the lookup fails, the monitor also materializes
-relevant fixed applications, runs focused rule batches, and attempts the
-bounded negative proof only when `Disjoint` currently has facts. With bounded
-token and constructor arity, the positive path is expected to take constant
-work per lexeme and linear total work.
+Egglog copy is made. If the lookup fails, the monitor may also materialize
+relevant fixed applications, run focused rule batches, and attempt a negative
+cover only when `Disjoint` currently has facts. With bounded token and
+constructor arity, the positive path is expected to take constant work per
+lexeme and linear total work.
 
 Ambiguous grammars can create more zippers and semantic combinations. A
 relevant e-class merge can enable many historical links at once. Those costs
@@ -36,11 +36,13 @@ matches per rule and focused class over the monitor lifetime. This may reduce
 positive precision, while rules which keep creating fresh focused classes can
 still fail to terminate.
 
-The negative proof caps a single constructor's Cartesian child combinations
+The negative cover caps a single constructor's Cartesian child combinations
 at 4,096 and returns `None` when that limit is exceeded. Each combination uses
-an indexed lookup of the corresponding Egglog constructor row. Context cycles
-are closed by visited `(memo, class-or-empty-hole)` states; long acyclic fixed
-subtrees are materialized iteratively rather than rejected by a depth limit.
+an indexed constructor-row lookup or an indexed unconditional-rewrite
+guarantee. Only outer applications demanded after a guarantee are created.
+Context cycles are closed by visited pairs of the PwZ memo and carried value;
+long acyclic fixed subtrees are materialized iteratively rather than rejected
+by a depth limit.
 
 ## Lexer cost
 

@@ -92,6 +92,19 @@ struct ConstructorSpec {
     name: String,
 }
 
+#[derive(Clone)]
+enum GuaranteedArgument {
+    Any,
+    Nullary(String),
+}
+
+#[derive(Clone)]
+struct GuaranteedOutput {
+    constructor: String,
+    arguments: Box<[GuaranteedArgument]>,
+    output: String,
+}
+
 struct ValidatedConstructor {
     name: String,
     schema: ConstructorSchema,
@@ -228,6 +241,7 @@ pub(crate) struct EgglogBackend {
     intersection_stale: bool,
     pending: Vec<EGraphChange>,
     disjoint_relation: bool,
+    guaranteed_outputs: Vec<Vec<GuaranteedOutput>>,
 }
 
 impl EgglogBackend {
@@ -238,6 +252,7 @@ impl EgglogBackend {
         target_binding: &str,
     ) -> Result<BackendInit, MonitorError> {
         let mut egraph = EGraph::default();
+        egraph.set_strict_mode(true);
         let commands = egraph.parse_program(None, program).map_err(egglog_error)?;
         reject_nonmonotone_commands(&commands)?;
         let commands = without_schedules(commands);
@@ -247,6 +262,7 @@ impl EgglogBackend {
         }
         let disjoint_relation = run.disjoint_relation_added;
         let rules = run.rules;
+        let output_guarantees = run.output_guarantees;
 
         let target_expression = binding_expression(&mut egraph, target_binding)?;
         let (target_sort, target_value) =
@@ -277,6 +293,16 @@ impl EgglogBackend {
             .map(|constructor| constructor.schema.clone())
             .collect::<Vec<_>>()
             .into();
+        let guaranteed_outputs = constructors
+            .iter()
+            .map(|constructor| {
+                output_guarantees
+                    .iter()
+                    .filter(|plan| plan.constructor == constructor.name)
+                    .cloned()
+                    .collect()
+            })
+            .collect();
         let schema = BackendSchema {
             constructors: constructor_schemas.clone(),
             constructor_ids,
@@ -309,6 +335,7 @@ impl EgglogBackend {
             intersection_stale: false,
             pending: Vec::new(),
             disjoint_relation,
+            guaranteed_outputs,
         };
         backend.install_rules(rules);
         backend.rebuild_target_focus();
@@ -499,6 +526,52 @@ impl EgglogBackend {
         })
     }
 
+    pub(crate) fn guaranteed_outputs(
+        &self,
+        constructor: ConstructorId,
+        children: &[Option<TypedClass<ValueId>>],
+    ) -> Option<Vec<TypedClass<ValueId>>> {
+        let mut outputs = Vec::new();
+        let mut matched = false;
+        for plan in self
+            .guaranteed_outputs
+            .get(constructor)
+            .into_iter()
+            .flatten()
+            .filter(|plan| plan.arguments.len() == children.len())
+        {
+            if !self.guarantee_matches(plan, children) {
+                continue;
+            }
+            matched = true;
+            let Some(output) = self.nullary_value(&plan.output) else {
+                continue;
+            };
+            if !outputs.iter().any(|known| self.equivalent(*known, output)) {
+                outputs.push(output);
+            }
+        }
+        matched.then_some(outputs)
+    }
+
+    pub(crate) fn materialize_guaranteed_output(
+        &mut self,
+        constructor: ConstructorId,
+        children: &[Option<TypedClass<ValueId>>],
+    ) -> Result<Option<TypedClass<ValueId>>, MonitorError> {
+        let outputs = self.guaranteed_outputs[constructor]
+            .iter()
+            .filter(|plan| self.guarantee_matches(plan, children))
+            .map(|plan| plan.output.clone())
+            .collect::<Vec<_>>();
+        for output in outputs {
+            if let Some(value) = self.add_nullary(&output)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) fn add_application(
         &mut self,
         constructor: ConstructorId,
@@ -636,6 +709,16 @@ impl EgglogBackend {
         self.disjoint_relation |= run.disjoint_relation_added;
         let relevant_union = run.relevant_union;
         self.install_rules(run.rules);
+        for plan in run.output_guarantees {
+            let Some(constructor) = self
+                .constructors
+                .iter()
+                .position(|candidate| candidate.name == plan.constructor)
+            else {
+                continue;
+            };
+            self.guaranteed_outputs[constructor].push(plan);
+        }
         let focus_changed = self.recanonicalize_focus();
         if focus_changed || relevant_union {
             self.rebuild_target_focus();
@@ -837,6 +920,81 @@ impl EgglogBackend {
         self.egraph.class_id_to_value(&class)
     }
 
+    fn nullary_value(&self, constructor: &str) -> Option<TypedClass<ValueId>> {
+        let function = self.egraph.get_function(constructor)?;
+        if !function.schema().input.is_empty() {
+            return None;
+        }
+        let sort = self
+            .sorts
+            .iter()
+            .position(|sort| sort.name == function.schema().output.name())?;
+        let value = self
+            .egraph
+            .read(|state| state.eclass_of(constructor, RawValues(Vec::new())))
+            .ok()??;
+        Some(TypedClass {
+            sort,
+            class: ValueId(self.canonical(&self.sorts[sort].sort, value)),
+        })
+    }
+
+    fn add_nullary(
+        &mut self,
+        constructor: &str,
+    ) -> Result<Option<TypedClass<ValueId>>, MonitorError> {
+        if let Some(value) = self.nullary_value(constructor) {
+            return Ok(Some(value));
+        }
+        let Some(function) = self.egraph.get_function(constructor) else {
+            return Ok(None);
+        };
+        if !function.schema().input.is_empty() {
+            return Ok(None);
+        }
+        let Some(sort) = self
+            .sorts
+            .iter()
+            .position(|sort| sort.name == function.schema().output.name())
+        else {
+            return Ok(None);
+        };
+        let value = self
+            .egraph
+            .update(|mut state| state.add(constructor, RawValues(Vec::new())))
+            .map_err(egglog_error)?;
+        if let Some(id) = self
+            .constructors
+            .iter()
+            .position(|candidate| candidate.name == constructor)
+        {
+            self.mark_constructor(id);
+        }
+        Ok(Some(TypedClass {
+            sort,
+            class: ValueId(self.canonical(&self.sorts[sort].sort, value)),
+        }))
+    }
+
+    fn guarantee_matches(
+        &self,
+        guarantee: &GuaranteedOutput,
+        children: &[Option<TypedClass<ValueId>>],
+    ) -> bool {
+        guarantee.arguments.len() == children.len()
+            && guarantee
+                .arguments
+                .iter()
+                .zip(children)
+                .all(|(pattern, child)| match pattern {
+                    GuaranteedArgument::Any => true,
+                    GuaranteedArgument::Nullary(pattern) => child.is_some_and(|child| {
+                        self.nullary_value(pattern)
+                            .is_some_and(|required| self.equivalent(child, required))
+                    }),
+                })
+    }
+
     fn validate_disjoint(&self) -> Result<(), MonitorError> {
         let Some(function) = self.egraph.get_function("Disjoint") else {
             return Ok(());
@@ -910,6 +1068,7 @@ struct ResolvedRulePlan {
 
 struct CommandRun {
     rules: Vec<ResolvedRulePlan>,
+    output_guarantees: Vec<GuaranteedOutput>,
     relevant_union: bool,
     disjoint_relation_added: bool,
     error: Option<MonitorError>,
@@ -921,12 +1080,17 @@ fn run_commands(
     focus: Option<&HashSet<FocusValue>>,
 ) -> CommandRun {
     let mut plans = Vec::new();
+    let mut output_guarantees = Vec::new();
     let mut relevant_union = false;
     let mut disjoint_relation_added = false;
     for command in commands.into_iter().flat_map(directed_rewrites) {
         relevant_union |= focus.is_some_and(|focus| union_touches_focus(egraph, &command, focus));
+        let mut output_guarantee = None;
         let scheduled = match command {
-            Command::Rewrite(_, rewrite, false) => compile_rewrite(egraph, rewrite),
+            Command::Rewrite(_, rewrite, false) => {
+                output_guarantee = rewrite_guarantee(&rewrite);
+                compile_rewrite(egraph, rewrite)
+            }
             Command::Rule { .. } => vec![(command, SelectorSpec::Global, None)],
             _ => {
                 let is_disjoint_relation = matches!(
@@ -936,6 +1100,7 @@ fn run_commands(
                 if let Err(error) = egraph.run_program(vec![command]).map_err(egglog_error) {
                     return CommandRun {
                         rules: plans,
+                        output_guarantees,
                         relevant_union,
                         disjoint_relation_added,
                         error: Some(error),
@@ -961,6 +1126,7 @@ fn run_commands(
                 Err(error) => {
                     return CommandRun {
                         rules: plans,
+                        output_guarantees,
                         relevant_union,
                         disjoint_relation_added,
                         error: Some(error),
@@ -968,9 +1134,11 @@ fn run_commands(
                 }
             }
         }
+        output_guarantees.extend(output_guarantee);
     }
     CommandRun {
         rules: plans,
+        output_guarantees,
         relevant_union,
         disjoint_relation_added,
         error: None,
@@ -982,6 +1150,46 @@ enum SelectorSpec {
     Lhs(String),
     Rhs(String),
     Global,
+}
+
+/// Recognizes unconditional user rewrites which guarantee a constructor's
+/// result despite unfinished arguments, such as `Add(Error, x) -> Error`.
+/// Unsupported shapes can only turn a negative answer into `Unknown`.
+fn rewrite_guarantee(rewrite: &egglog::ast::Rewrite) -> Option<GuaranteedOutput> {
+    if !rewrite.conditions.is_empty() {
+        return None;
+    }
+    let GenericExpr::Call(_, constructor, arguments) = &rewrite.lhs else {
+        return None;
+    };
+    let GenericExpr::Call(_, output, output_arguments) = &rewrite.rhs else {
+        return None;
+    };
+    if !output_arguments.is_empty() {
+        return None;
+    }
+
+    let mut variables = HashSet::new();
+    let arguments = arguments
+        .iter()
+        .map(|argument| match argument {
+            GenericExpr::Var(_, variable)
+                if !variable.starts_with(egglog::GLOBAL_NAME_PREFIX)
+                    && variables.insert(variable.clone()) =>
+            {
+                Some(GuaranteedArgument::Any)
+            }
+            GenericExpr::Call(_, constructor, children) if children.is_empty() => {
+                Some(GuaranteedArgument::Nullary(constructor.clone()))
+            }
+            GenericExpr::Var(..) | GenericExpr::Call(..) | GenericExpr::Lit(..) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(GuaranteedOutput {
+        constructor: constructor.clone(),
+        arguments: arguments.into(),
+        output: output.clone(),
+    })
 }
 
 fn compile_rewrite(

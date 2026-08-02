@@ -1,8 +1,8 @@
 //! Incremental intersection of a PwZ graph and Egglog.
 //!
 //! PwZ remains the sole owner of parse expressions and continuations. The
-//! Egglog adapter remains the sole owner of applications and equality. This module
-//! stores only the two cross-system relations: `Produces` and
+//! Egglog adapter remains the sole owner of applications and equality. This
+//! module stores only the two cross-system relations: `Produces` and
 //! `RealizableFor` (whose value-independent case is `Realizable`).
 
 use std::{hash::Hash, sync::Arc};
@@ -353,14 +353,17 @@ impl RealizabilityEngine {
         })
     }
 
-    /// True only when every represented completion has a known whole value
-    /// and the user's `Disjoint` relation separates each value from the
-    /// target. The walk is temporary; no negative facts are retained.
+    /// True only when every syntactic completion of every live zipper is
+    /// covered by a whole-result class which the user's `Disjoint` relation
+    /// separates from the target. Qualifying user rewrites may cover a
+    /// constructor before all of its syntax has arrived. The walk is
+    /// temporary; no negative facts are retained.
     pub(crate) fn is_unrealizable(&self, pwz: &Pwz<TokenValues>, egraph: &EgglogBackend) -> bool {
         if !egraph.has_disjoint_facts() {
             return false;
         }
-        let Some(outputs) = DisjointProof::new(self, pwz, egraph).whole_outputs() else {
+        let mut cover = CompletionCover::new(self, pwz, egraph);
+        let Some(outputs) = cover.all_outputs() else {
             return false;
         };
         !outputs.is_empty()
@@ -587,62 +590,68 @@ impl RealizabilityEngine {
                 let mut choices = Vec::with_capacity(arguments.len());
                 for (argument, position) in arguments.iter().copied().enumerate() {
                     let values = self.context_values(left, right, hole, position);
-                    let mut row = Vec::new();
+                    let mut row: Vec<Option<TypedClass<ValueId>>> = Vec::new();
                     for value in values {
                         if value.sort == schema.inputs[argument]
-                            && !row.iter().any(|known| egraph.equivalent(*known, value))
+                            && !row
+                                .iter()
+                                .flatten()
+                                .any(|known| egraph.equivalent(*known, value))
                         {
-                            row.push(value);
+                            row.push(Some(value));
                         }
                     }
                     if row.is_empty() {
-                        return Ok(Vec::new());
+                        row.push(None);
                     }
                     choices.push(row);
                 }
 
-                // If the action depends on syntax to the right of the hole,
-                // use only constructor rows already present in Egglog. Those
-                // rows are concrete completions of the current prefix. When
-                // every selected child is already fixed, construct the one
-                // fixed AST fragment so user rewrites can see it immediately.
-                if arguments.iter().any(|position| *position > left.len()) {
-                    let mut outputs = Vec::new();
-                    let mut applications = Vec::new();
-                    egraph.for_each_application(constructor, |application| {
-                        applications.push(application)
-                    });
-                    for application in applications {
-                        if application.children.len() != choices.len()
-                            || !application
-                                .children
-                                .iter()
-                                .enumerate()
-                                .all(|(argument, class)| {
-                                    choices[argument].iter().any(|candidate| {
-                                        egraph.equivalent(
-                                            *candidate,
-                                            TypedClass {
-                                                sort: schema.inputs[argument],
-                                                class: *class,
-                                            },
-                                        )
-                                    })
-                                })
-                        {
-                            continue;
-                        }
-                        outputs.push(TypedClass {
-                            sort: schema.output,
-                            class: application.output,
-                        });
-                    }
-                    return Ok(outputs);
+                let combinations = choices
+                    .iter()
+                    .try_fold(1usize, |count, row| count.checked_mul(row.len()));
+                if combinations.is_none_or(|count| count > MAX_DISJOINT_COMBINATIONS) {
+                    return Ok(Vec::new());
                 }
 
+                let has_future = arguments.iter().any(|position| *position > left.len());
                 let mut outputs = Vec::new();
                 for children in products(&choices) {
-                    outputs.push(egraph.add_application(constructor, &children)?);
+                    let concrete = children.iter().copied().collect::<Option<Vec<_>>>();
+                    if !has_future && let Some(children) = concrete.as_deref() {
+                        outputs.push(egraph.add_application(constructor, children)?);
+                        continue;
+                    }
+                    if let Some(guaranteed) = egraph.guaranteed_outputs(constructor, &children) {
+                        let guaranteed = if guaranteed.is_empty() {
+                            egraph
+                                .materialize_guaranteed_output(constructor, &children)?
+                                .into_iter()
+                                .collect()
+                        } else {
+                            guaranteed
+                        };
+                        for output in guaranteed {
+                            if !outputs
+                                .iter()
+                                .any(|known| egraph.equivalent(*known, output))
+                            {
+                                outputs.push(output);
+                            }
+                        }
+                        continue;
+                    }
+
+                    let Some(children) = concrete else {
+                        continue;
+                    };
+                    if let Some(output) = egraph.existing_application(constructor, &children)
+                        && !outputs
+                            .iter()
+                            .any(|known| egraph.equivalent(*known, output))
+                    {
+                        outputs.push(output);
+                    }
                 }
                 Ok(outputs)
             }
@@ -1405,8 +1414,8 @@ impl RealizabilityEngine {
 
 const MAX_DISJOINT_COMBINATIONS: usize = 4_096;
 
-/// One bounded, read-only proof attempt for the current prefix.
-struct DisjointProof<'a> {
+/// A finite e-class cover for all ASTs represented by the current zippers.
+struct CompletionCover<'a> {
     engine: &'a RealizabilityEngine,
     pwz: &'a Pwz<TokenValues>,
     egraph: &'a EgglogBackend,
@@ -1414,7 +1423,7 @@ struct DisjointProof<'a> {
     visiting: HashSet<ExpressionId>,
 }
 
-impl<'a> DisjointProof<'a> {
+impl<'a> CompletionCover<'a> {
     fn new(
         engine: &'a RealizabilityEngine,
         pwz: &'a Pwz<TokenValues>,
@@ -1429,7 +1438,7 @@ impl<'a> DisjointProof<'a> {
         }
     }
 
-    fn whole_outputs(mut self) -> Option<Vec<TypedClass<ValueId>>> {
+    fn all_outputs(&mut self) -> Option<Vec<TypedClass<ValueId>>> {
         let mut pending = Vec::new();
         for zipper in self.pwz.zippers() {
             let values = self.engine.focus_classes(&zipper.focus);
@@ -1503,8 +1512,8 @@ impl<'a> DisjointProof<'a> {
                         .map(|position| {
                             self.child_values(context_child(left, right, *position), hole)
                         })
-                        .collect::<Option<Vec<_>>>()?;
-                    self.constructor_outputs(*constructor, children)
+                        .collect::<Vec<_>>();
+                    self.constructor_cover(*constructor, children)
                 }
             },
         }
@@ -1516,7 +1525,7 @@ impl<'a> DisjointProof<'a> {
         hole: Option<TypedClass<ValueId>>,
     ) -> Option<Vec<TypedClass<ValueId>>> {
         match child {
-            Child::Hole => Some(hole.into_iter().collect()),
+            Child::Hole => hole.map(|value| vec![value]),
             Child::Fixed(expression) => self.expression_outputs(expression),
         }
     }
@@ -1530,9 +1539,6 @@ impl<'a> DisjointProof<'a> {
         }
 
         let parsed = &self.pwz.expressions[&expression];
-        // Before a negative query, `Monitor::synchronize` materializes every
-        // selected fixed subtree in postorder. Its closed `Produces` rows are
-        // therefore the complete semantic alternatives for this expression.
         let result = if parsed.fixed {
             let mut values = Vec::new();
             for value in self.engine.closure.produces.values(expression) {
@@ -1549,7 +1555,7 @@ impl<'a> DisjointProof<'a> {
                             self.push_unique(&mut values, value);
                         }
                     }
-                    Some(values)
+                    (!values.is_empty()).then_some(values)
                 }
                 ExpressionNode::Seq { symbol, children } => match symbol {
                     Symbol::Token(token) => {
@@ -1557,7 +1563,7 @@ impl<'a> DisjointProof<'a> {
                         for &value in &token.payload {
                             self.push_unique(&mut values, value);
                         }
-                        Some(values)
+                        (!values.is_empty()).then_some(values)
                     }
                     Symbol::Bottom => children
                         .last()
@@ -1575,8 +1581,8 @@ impl<'a> DisjointProof<'a> {
                                 let values = arguments
                                     .iter()
                                     .map(|position| self.expression_outputs(children[*position]))
-                                    .collect::<Option<Vec<_>>>()?;
-                                self.constructor_outputs(*constructor, values)
+                                    .collect::<Vec<_>>();
+                                self.constructor_cover(*constructor, values)
                             }
                         }
                     }
@@ -1589,10 +1595,10 @@ impl<'a> DisjointProof<'a> {
         result
     }
 
-    fn constructor_outputs(
+    fn constructor_cover(
         &mut self,
         constructor: ConstructorId,
-        children: Vec<Vec<TypedClass<ValueId>>>,
+        children: Vec<Option<Vec<TypedClass<ValueId>>>>,
     ) -> Option<Vec<TypedClass<ValueId>>> {
         let schema = &self.engine.schema.constructors[constructor];
         if children.len() != schema.inputs.len() {
@@ -1600,14 +1606,23 @@ impl<'a> DisjointProof<'a> {
         }
         let mut choices = Vec::with_capacity(children.len());
         for (values, &sort) in children.into_iter().zip(&schema.inputs) {
-            let mut matching = Vec::new();
-            for value in values.into_iter().filter(|value| value.sort == sort) {
-                self.push_unique(&mut matching, value);
-            }
-            if matching.is_empty() {
-                return None;
-            }
-            choices.push(matching);
+            let values = match values {
+                Some(values) => {
+                    let mut matching = Vec::new();
+                    for value in values.into_iter().filter(|value| value.sort == sort) {
+                        let value = self.egraph.canonical_class(value);
+                        if !matching.contains(&Some(value)) {
+                            matching.push(Some(value));
+                        }
+                    }
+                    if matching.is_empty() {
+                        return None;
+                    }
+                    matching
+                }
+                None => vec![None],
+            };
+            choices.push(values);
         }
 
         let combinations = choices
@@ -1618,7 +1633,17 @@ impl<'a> DisjointProof<'a> {
         }
         let mut outputs = Vec::new();
         for children in products(&choices) {
-            let output = self.egraph.existing_application(constructor, &children)?;
+            if let Some(guaranteed) = self.egraph.guaranteed_outputs(constructor, &children) {
+                if guaranteed.is_empty() {
+                    return None;
+                }
+                for output in guaranteed {
+                    self.push_unique(&mut outputs, output);
+                }
+                continue;
+            }
+            let concrete = children.into_iter().collect::<Option<Vec<_>>>()?;
+            let output = self.egraph.existing_application(constructor, &concrete)?;
             self.push_unique(&mut outputs, output);
         }
         Some(outputs)
@@ -1653,7 +1678,7 @@ fn bottom_child(left: &[ExpressionId], right: &[ExpressionId]) -> Child {
     context_child(left, right, left.len() + right.len())
 }
 
-fn products<C: Copy>(choices: &[Vec<TypedClass<C>>]) -> Vec<Vec<TypedClass<C>>> {
+fn products<T: Copy>(choices: &[Vec<T>]) -> Vec<Vec<T>> {
     let mut products = vec![Vec::new()];
     for choices in choices {
         let mut next = Vec::with_capacity(products.len().saturating_mul(choices.len()));
