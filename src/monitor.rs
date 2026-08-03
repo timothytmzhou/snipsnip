@@ -9,8 +9,8 @@ use crate::{
     realizability::{RealizabilityEngine, TokenValues},
 };
 
-/// A PwZ parser, a semantic e-graph, and only the relation linking
-/// them. No parse tree or e-node is copied into this facade.
+/// A PwZ parser, a semantic e-graph, and only the indexed links between them.
+/// No parse graph or e-graph is copied into this facade.
 pub struct Monitor {
     input: Arc<RuntimeInput>,
     parser: Pwz<TokenValues>,

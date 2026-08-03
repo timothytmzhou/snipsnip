@@ -153,8 +153,9 @@ pub struct TypeScriptAnalyzer {
 }
 
 impl TypeScriptAnalyzer {
-    /// Creates an analyzer and validates that `program` defines `$required`,
-    /// `Disjoint`, and all constructors used by the TypeScript grammar.
+    /// Creates an analyzer and validates `$required` and every constructor
+    /// used by the TypeScript grammar. If `Disjoint` is present, the monitor
+    /// also validates its signature and irreflexivity.
     pub fn new(program: impl Into<String>) -> Result<Self, AnalyzerError> {
         let grammar = Grammar::from_yacc_lex(TYPESCRIPT_YACC, TYPESCRIPT_LEX)?;
         let program = program.into();

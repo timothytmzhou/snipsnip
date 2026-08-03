@@ -152,6 +152,104 @@ fn an_open_operator_prefix_keeps_a_valid_completion() {
 }
 
 #[test]
+fn a_poisoned_expression_is_unrealizable_before_the_semicolon() {
+    let report = analyze("let answer: number = (1).length ");
+    let dot = report
+        .tokens
+        .iter()
+        .find(|token| token.lexeme == ".")
+        .unwrap();
+    let length = report
+        .tokens
+        .iter()
+        .find(|token| token.lexeme == "length")
+        .unwrap();
+
+    assert_eq!(dot.realizability, RealizabilityState::Unknown);
+    assert_eq!(length.realizability, RealizabilityState::Unrealizable);
+    assert_eq!(report.realizability, RealizabilityState::Unrealizable);
+}
+
+#[test]
+fn an_incomplete_operator_is_rejected_only_when_every_rhs_is_poisoned() {
+    assert_eq!(
+        analyze("let answer: number = \"x\"").realizability,
+        RealizabilityState::Realizable
+    );
+    assert_eq!(
+        analyze("let answer: number = \"x\" -").realizability,
+        RealizabilityState::Unrealizable
+    );
+
+    let program = DEFAULT_EGGLOG_PROGRAM.replace(
+        "(rewrite (Subtract (StringExpression) other) (ExpressionError))",
+        "",
+    );
+    assert_eq!(
+        TypeScriptAnalyzer::new(program)
+            .unwrap()
+            .analyze("let answer: number = \"x\" -")
+            .unwrap()
+            .realizability,
+        RealizabilityState::Unknown
+    );
+}
+
+#[test]
+fn poison_stays_unrealizable_through_more_unfinished_contexts() {
+    for source in [
+        "let answer: number = (1).length +",
+        "let answer: number = (1).length(",
+    ] {
+        assert_eq!(
+            analyze(source).realizability,
+            RealizabilityState::Unrealizable,
+            "{source}"
+        );
+    }
+
+    for rule in [
+        "(rewrite (Add (ExpressionError) other) (ExpressionError))",
+        "(rewrite (Call (ExpressionError) other) (ExpressionError))",
+    ] {
+        let program = DEFAULT_EGGLOG_PROGRAM.replace(rule, "");
+        let source = if rule.contains("Add") {
+            "let answer: number = (1).length +"
+        } else {
+            "let answer: number = (1).length("
+        };
+        assert_eq!(
+            TypeScriptAnalyzer::new(program)
+                .unwrap()
+                .analyze(source)
+                .unwrap()
+                .realizability,
+            RealizabilityState::Unknown,
+            "missing {rule}"
+        );
+    }
+}
+
+#[test]
+fn primitive_values_are_not_callable_but_number_is() {
+    for source in [
+        "let answer: number = 1(",
+        "let answer: number = true(",
+        "let answer: number = \"x\"(",
+    ] {
+        assert_eq!(
+            analyze(source).realizability,
+            RealizabilityState::Unrealizable,
+            "{source}"
+        );
+    }
+    assert_eq!(
+        analyze("let answer: number = Number(").realizability,
+        RealizabilityState::Realizable
+    );
+}
+
+#[test]
 fn deleting_typing_rules_removes_both_positive_and_negative_semantic_proofs() {
     let mut without_rules = TypeScriptAnalyzer::new(NO_TYPING_RULES).unwrap();
     assert_eq!(

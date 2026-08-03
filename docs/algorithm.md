@@ -34,17 +34,18 @@ contexts, and memos live in maps, so cycles do not require pointer graphs.
 `egglog_backend` owns the only e-graph. It validates the constructors used by
 grammar actions, converts complete token values to Egglog values, reads
 constructor applications and equality classes, runs the user's rules, and
-reports structural changes. It does not own or copy PwZ state.
+reports structural changes. It also indexes the restricted unconditional
+rewrite shapes that can guarantee a result despite unfinished constructor
+arguments. It does not own or copy PwZ state.
 
 The user's program is authoritative. The monitor does not invent equations,
 rewrites, or typing rules.
 
-### Monitor and realizability engine
+### Monitor link state
 
-`Monitor` owns one PwZ parser, one Egglog adapter, and one
-`RealizabilityEngine`. The engine is the link between the two representations.
-It retains only indexed cross-system facts and consumes the `Changes` returned
-by `derive`; it does not retain a second parse forest or a second e-graph.
+`Monitor` owns one PwZ parser, one Egglog adapter, and the indexed links between
+them. It consumes the `Changes` returned by `derive`; it does not retain a
+second parse forest or a second e-graph.
 
 ## Positive intersection
 
@@ -80,19 +81,28 @@ user's rules. The relation is read in either argument order. The backend
 rejects `Disjoint(x, x)` after canonicalizing e-classes. An absent or empty
 relation costs no zipper walk.
 
-For a negative answer, the engine makes one temporary, read-only walk from
-every zipper focus through its contexts. It evaluates only children selected
-by semantic actions and matches constructor combinations against applications
-already in Egglog. Repeated `(memo, class-or-empty-hole)` states close context
-cycles. A selected future token, a recursive expression cycle, a missing
-constructor combination, an empty required value set, or more than 4,096
-combinations at one constructor makes the whole attempt inconclusive.
+For a negative answer, the monitor computes a temporary finite e-class cover
+of every AST represented by every live zipper. Alternation requires every
+branch; construction requires every combination of selected children. Known
+combinations use existing Egglog applications. An unfinished child can be
+crossed only when an unconditional user rewrite guarantees the constructor's
+result for every value of that child, for example `Add(Error, x) -> Error`.
+Outer applications reached from such a result are materialized on demand and
+sent through focused saturation. Nothing outside a current zipper proof path
+is created.
 
-The result is `Some(false)` only when this produces a nonempty exhaustive list
-and `Disjoint(output, target)` holds for every output. Otherwise it is `None`.
-Thus a limit or incomplete saturation can reduce precision but cannot create a
-negative answer. As with every user Egglog rule, the program author is
-responsible for the truth of `Disjoint` facts.
+The current fragment is never compared directly with the target: later syntax
+may wrap or transform it. The cover is carried through every live context to a
+top-level result. Repeated pairs of a PwZ memo and carried e-class close context
+cycles; processing the pair once has already considered every finite exit.
+
+The result is `Some(false)` only when the cover is nonempty and
+`Disjoint(output, target)` holds for every covering class. An uncovered branch,
+unsupported rewrite shape, recursive expression whose cover cannot be closed,
+missing value, or more than 4,096 combinations at one constructor yields
+`None`. Thus a work limit or incomplete saturation can reduce precision but
+cannot create a negative answer. The program author remains responsible for
+the truth of user-defined rewrites and `Disjoint` facts.
 
 ## Focused equality saturation
 
@@ -103,9 +113,11 @@ after synchronization.
 
 When no positive witness is present, it materializes selected fixed subtrees
 in postorder and then the exact applications needed along current zipper
-contexts. The target class and classes found on those paths form the current
-focus. Focus is closed downward through every visible equality-output
-constructor, so nested relevant redexes are included.
+contexts. A negative cover may additionally demand an outer application after
+a user rewrite has summarized unfinished syntax. The target class and classes
+found on those paths form the current focus. Focus is closed downward through
+every visible equality-output constructor, so nested relevant redexes are
+included.
 
 Each local step selects at most 64 matches per installed internal rule. The
 monitor propagates the delta and repeats while the e-graph changed or relevant
@@ -153,8 +165,11 @@ decomposes into the same constructor rows, so work-list closure derives its
 `Produces` and `RealizableFor` facts. Therefore `Some(true)` is equivalent to
 an exhibited member of `PrefixSpace(w)` in the target class.
 
-Syntax death is exact by the PwZ invariant. In the other negative case, the
-walk returns outputs only after every selected branch was represented within
-its work bound. If every output is related to the target by sound `Disjoint`,
-none can be the target. Therefore every returned `Some(false)` is sound. All
-remaining cases return `None`.
+Syntax death is exact by the PwZ invariant. In the other negative case, each
+live route is covered either by an existing constructor application or by an
+unconditional rewrite whose result does not depend on its unfinished
+arguments. Structural induction over expressions and contexts therefore shows
+that every possible completed AST belongs to one of the returned classes. If
+every such class is related to the target by sound `Disjoint`, none can be the
+target. Therefore every returned `Some(false)` is sound. All remaining cases
+return `None`.

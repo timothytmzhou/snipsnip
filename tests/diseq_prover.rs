@@ -337,6 +337,132 @@ fn initial_rewrites_are_run_locally_before_the_parse_is_complete() {
     );
 }
 
+fn recursive_poison_monitor(poison_rule: &str) -> Monitor {
+    let grammar = Grammar::from_yacc(
+        r#"
+        %start start
+        %token GOOD BAD PLUS END
+        %%
+        start: expr END       { $1 };
+        expr: atom            { $1 }
+            | expr PLUS atom  { Add(1, 3) }
+            ;
+        atom: GOOD            { Good() }
+            | BAD             { Bad() }
+            ;
+        "#,
+    )
+    .unwrap();
+    Monitor::new(
+        &grammar,
+        &format!(
+            r#"
+            (datatype Result (Good) (Bad) (Add Result Result))
+            (relation Disjoint (Result Result))
+            (Disjoint (Bad) (Good))
+            (let $target (Good))
+            {poison_rule}
+            "#
+        ),
+        "$target",
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_poisoned_fragment_rules_out_every_recursive_continuation() {
+    let mut monitor = recursive_poison_monitor("(rewrite (Add (Bad) other) (Bad))");
+
+    assert_eq!(monitor.push_token_name("BAD", "bad").unwrap(), Some(false));
+}
+
+#[test]
+fn disjointness_without_a_poison_rule_does_not_skip_recursive_continuations() {
+    let mut monitor = recursive_poison_monitor("");
+
+    assert_eq!(monitor.push_token_name("BAD", "bad").unwrap(), None);
+}
+
+#[test]
+fn a_late_poison_rule_rechecks_the_current_incomplete_prefix() {
+    let mut monitor = recursive_poison_monitor("");
+    assert_eq!(monitor.push_token_name("BAD", "bad").unwrap(), None);
+
+    assert_eq!(
+        monitor
+            .run_egglog("(rewrite (Add (Bad) other) (Bad))")
+            .unwrap(),
+        Some(false)
+    );
+}
+
+#[test]
+fn every_fixed_alternative_must_be_forced_across_an_unfinished_child() {
+    let grammar = Grammar::from_yacc(
+        r#"
+        %start start
+        %token VALUE PLUS END
+        %%
+        start: expr END       { $1 };
+        expr: atom            { $1 }
+            | expr PLUS atom  { Add(1, 3) }
+            ;
+        atom: VALUE           { Bad() }
+            | VALUE           { Neutral() }
+            ;
+        "#,
+    )
+    .unwrap();
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Result (Target) (Bad) (Neutral) (Add Result Result))
+        (relation Disjoint (Result Result))
+        (Disjoint (Bad) (Target))
+        (let $target (Target))
+        (rewrite (Add (Bad) other) (Bad))
+        "#,
+        "$target",
+    )
+    .unwrap();
+
+    assert_eq!(monitor.push_token_name("VALUE", "value").unwrap(), None);
+    assert_eq!(monitor.push_token_name("PLUS", "+").unwrap(), None);
+}
+
+#[test]
+fn an_egglog_global_is_not_a_wildcard_for_an_unfinished_child() {
+    let grammar = Grammar::from_yacc(
+        r#"
+        %start start
+        %token NEUTRAL PLUS END
+        %%
+        start: expr END       { $1 };
+        expr: atom            { $1 }
+            | expr PLUS atom  { Add(1, 3) }
+            ;
+        atom: NEUTRAL         { Neutral() };
+        "#,
+    )
+    .unwrap();
+    let mut monitor = Monitor::new(
+        &grammar,
+        r#"
+        (datatype Result (Target) (Bad) (Poison) (Neutral) (Add Result Result))
+        (relation Disjoint (Result Result))
+        (Disjoint (Bad) (Target))
+        (let $target (Target))
+        (let $poison (Poison))
+        (rewrite (Add $poison other) (Bad))
+        "#,
+        "$target",
+    )
+    .unwrap();
+
+    assert_eq!(monitor.push_token_name("NEUTRAL", "neutral").unwrap(), None);
+    assert_eq!(monitor.push_token_name("PLUS", "+").unwrap(), None);
+}
+
 #[test]
 fn an_existing_disjoint_proof_does_not_run_unneeded_productive_rules() {
     let grammar = Grammar::from_yacc(
